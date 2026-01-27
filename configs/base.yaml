@@ -1,1 +1,32 @@
 # Base configuration for SAE steerability experiments
+
+
+experiment:
+  name: "sae-steerability"
+  seed: 42
+
+model:
+  model_id: "gpt2"  # Using public model for testing
+  device: "cpu"
+  dtype: "float32"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_id: "TBD"
+  hook_point: "TBD"
+  normalize_decoder: true
+  n_features_total: 1000  # Fallback when SAE loading unavailable
+
+features:
+  n_features: 300
+  selection_mode: "uniform"
+  activation_stats_path: null
+
+steering:
+  alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 2.0, 5.0, 10.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.05
