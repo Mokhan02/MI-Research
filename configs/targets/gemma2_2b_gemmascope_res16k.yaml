@@ -15,22 +15,23 @@ model:
 sae:
   source: "neuronpedia"
   sae_set: "gemmascope-res-16k"
-  sae_id: "TBD"  # TODO: Get specific SAE ID from Neuronpedia for layer 20
-  layer_idx: 20  # Provisional - CONFIRM this layer exists in SAE set
-  hook_point: "blocks.20.hook_resid_post"  # Provisional - CONFIRM exact naming from SAE metadata
+  sae_id: "TBD"  # Neuronpedia: 20-gemmascope-res-16k/2263
+  layer_idx: 20
+  hook_point: "blocks.20.hook_resid_post"  # TransformerLens-style; maps to model.layers.20
   normalize_decoder: true
-  weights_repo: "google/gemma-scope"  # CONFIRM: Verify this is the correct HuggingFace repo
-  n_features_total: 16384  # CONFIRM: Verify this matches SAE dictionary size
+  weights_repo: "google/gemma-scope-2b-pt-res"
+  weights_path: "layer_20/width_16k/average_l0_71/params.npz"
+  n_features_total: 16384
 
-# Model architecture specs (to be verified)
+# Model architecture specs (verified for google/gemma-2-2b)
 architecture:
-  d_model: 2048  # CONFIRM: Verify this matches model.config.hidden_size
+  d_model: 2304  # model.config.hidden_size for Gemma-2-2b
   n_layers: 18  # TODO: Verify total number of layers in Gemma-2-2b
   vocab_size: 256000  # TODO: Verify vocab size
 
-# SAE decoder weights specs (to be verified)
+# SAE decoder weights specs
 sae_specs:
-  decoder_shape: [16384, 2048]  # CONFIRM: Should be (n_features, d_model)
+  decoder_shape: [16384, 2304]  # (n_features_total, d_model)
   # TODO: Verify decoder weights are stored as:
   # - .safetensors format?
   # - Normalized already?
@@ -54,6 +55,10 @@ experiment:
   name: "gemma2-2b-gemmascope-res16k-layer20"
   seed: 42
   phase: 1
+
+# Sanity check (hook sanity script)
+sanity:
+  feature_id: 2263  # Neuronpedia feature index for first real run
 
 # Verification checklist (see docs/target.md)
 # [ ] confirm hook_point naming from SAE metadata
