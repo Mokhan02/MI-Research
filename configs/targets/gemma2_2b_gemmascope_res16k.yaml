@@ -1,0 +1,64 @@
+# Phase 1 Locked Target: Gemma-2-2b with GemmaScope SAE
+# 
+# Model: google/gemma-2-2b
+# SAE Set: gemmascope-res-16k (resid_post SAEs, 16k features)
+# Layer: 20 (middle layer, to be confirmed)
+
+model:
+  model_id: "google/gemma-2-2b"
+  device: "cuda"  # Use GPU for real experiments
+  dtype: "bfloat16"  # Use bfloat16 for memory efficiency on A10
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_set: "gemmascope-res-16k"
+  sae_id: "TBD"  # TODO: Get specific SAE ID from Neuronpedia for layer 20
+  layer_idx: 20  # Provisional - CONFIRM this layer exists in SAE set
+  hook_point: "blocks.20.hook_resid_post"  # Provisional - CONFIRM exact naming from SAE metadata
+  normalize_decoder: true
+  weights_repo: "google/gemma-scope"  # CONFIRM: Verify this is the correct HuggingFace repo
+  n_features_total: 16384  # CONFIRM: Verify this matches SAE dictionary size
+
+# Model architecture specs (to be verified)
+architecture:
+  d_model: 2048  # CONFIRM: Verify this matches model.config.hidden_size
+  n_layers: 18  # TODO: Verify total number of layers in Gemma-2-2b
+  vocab_size: 256000  # TODO: Verify vocab size
+
+# SAE decoder weights specs (to be verified)
+sae_specs:
+  decoder_shape: [16384, 2048]  # CONFIRM: Should be (n_features, d_model)
+  # TODO: Verify decoder weights are stored as:
+  # - .safetensors format?
+  # - Normalized already?
+  # - How to load from weights_repo?
+
+# Feature selection for this target
+features:
+  n_features: 300  # Sample size for experiment
+  selection_mode: "uniform"  # Start with uniform, can switch to stratified later
+  activation_stats_path: null  # TODO: Generate activation stats for stratified sampling
+
+# Steering parameters (from base config)
+steering:
+  alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 2.0, 5.0, 10.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.05
+
+# Experiment metadata
+experiment:
+  name: "gemma2-2b-gemmascope-res16k-layer20"
+  seed: 42
+  phase: 1
+
+# Verification checklist (see docs/target.md)
+# [ ] confirm hook_point naming from SAE metadata
+# [ ] confirm decoder shape (n_features x d_model)
+# [ ] confirm layer index exists in the SAE set
+# [ ] verify weights_repo contains SAE checkpoints
+# [ ] test model loading and hook point resolution
+# [ ] test SAE loading and decoder weight extraction
