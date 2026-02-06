@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+
+# experiment artifacts
+outputs/
+data/cache/
+**/__pycache__/
+.venv/
