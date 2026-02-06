@@ -135,9 +135,12 @@ def create_steering_hook(v_f: torch.Tensor, alpha: float, device: str):
         else:
             activations = output.clone()
         
-        # Ensure v_f is on same device
-        v_f_device = v_f.to(activations.device)
+        # Ensure v_f is on same device and dtype as activations
+        v_f_device = v_f.to(device=activations.device, dtype=activations.dtype)
         
+        # Shape safety: expect (batch, seq, d_model) or (batch, d_model)
+        assert len(activations.shape) in (2, 3), \
+            f"Expected activation shape [batch, seq?, d_model], got {activations.shape}"
         # Handle shape compatibility
         # v_f is 1D (d_model,), activations might be 2D or 3D
         if len(activations.shape) == 3:  # (batch, seq, hidden)
@@ -151,11 +154,11 @@ def create_steering_hook(v_f: torch.Tensor, alpha: float, device: str):
         assert v_f_expanded.shape[-1] == activations.shape[-1], \
             f"Feature vector dim {v_f_expanded.shape[-1]} != activation dim {activations.shape[-1]}"
         
-        # Capture activation before modification (for comparison)
-        captured_activations.append(activations.clone().detach())
-        
         # Apply steering: activation += alpha * v_f
         activations.add_(alpha * v_f_expanded)
+        
+        # Capture activation after modification (for delta comparison)
+        captured_activations.append(activations.clone().detach())
         
         if isinstance(output, tuple):
             return (activations,) + output[1:]
