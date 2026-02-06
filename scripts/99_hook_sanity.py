@@ -20,30 +20,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.config import load_config, resolve_config, save_resolved_config
 from src.model_utils import load_model
 from src.hook_resolver import resolve_hook_point
+from src.sae_loader import load_gemmascope_decoder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def get_feature_vector(config: dict, model, hook_point_module: torch.nn.Module) -> torch.Tensor:
-    """
-    Get or create a feature vector v_f.
-    
-    If SAE loading is available, use it. Otherwise, create a placeholder.
-    
-    Returns:
-        v_f: Feature vector with shape matching hook point output
-    """
+def _make_placeholder(config: dict, model, hook_point_module: torch.nn.Module) -> torch.Tensor:
+    """Create a placeholder feature vector when not using neuronpedia SAE. Infer d_model from hook module or config."""
     sae_cfg = config.get("sae", {})
-    sae_id = sae_cfg.get("sae_id", "TBD")
-    
-    if sae_id != "TBD":
-        # TODO: Load actual SAE feature vector
-        logger.warning("SAE loading not yet implemented. Using PLACEHOLDER feature vector.")
-    
-    # Create placeholder feature vector
-    # Infer hidden dimension from hook point module
-    # Try to get output dimension
     if hasattr(hook_point_module, "out_features"):
         d_model = hook_point_module.out_features
     elif hasattr(hook_point_module, "embed_dim"):
@@ -51,25 +36,51 @@ def get_feature_vector(config: dict, model, hook_point_module: torch.nn.Module) 
     elif hasattr(hook_point_module, "hidden_size"):
         d_model = hook_point_module.hidden_size
     else:
-        # Fallback: try to infer from model config
         if hasattr(model, "config"):
             d_model = getattr(model.config, "hidden_size", 2048)
         else:
-            d_model = 2048  # Default fallback
+            d_model = config.get("architecture", {}).get("d_model", 2048)
         logger.warning(f"Could not infer d_model from hook point. Using {d_model}")
-    
-    # Create placeholder feature vector
     np.random.seed(config["experiment"]["seed"])
     v_f = torch.randn(d_model, dtype=torch.float32)
-    
-    # Normalize if config says so
     if sae_cfg.get("normalize_decoder", True):
         v_f = torch.nn.functional.normalize(v_f, dim=0)
-    
-    logger.warning(f"Using PLACEHOLDER feature vector v_f with shape {v_f.shape}")
-    logger.info(f"Feature vector norm: {v_f.norm().item():.4f}")
-    
+    logger.info(f"Using placeholder v_f: shape={v_f.shape}, norm={v_f.norm().item():.4f}")
     return v_f
+
+
+def get_feature_vector(config: dict, model, hook_point_module: torch.nn.Module) -> torch.Tensor:
+    """
+    Get feature vector v_f: from Neuronpedia SAE decoder or placeholder.
+    If sae.source == "neuronpedia" and weights_repo/weights_path exist, loading must succeed (no placeholder).
+    """
+    sae = config.get("sae", {})
+    source = sae.get("source")
+    has_weights = bool(sae.get("weights_repo") and sae.get("weights_path"))
+
+    if source == "neuronpedia" and has_weights:
+        # Hard path: load decoder, no fallback; any failure raises
+        decoder, meta = load_gemmascope_decoder(config)
+        n_features_total = config["sae"]["n_features_total"]
+        d_model = config["architecture"]["d_model"]
+        feature_id = config.get("sanity", {}).get("feature_id")
+        if feature_id is None:
+            raise ValueError("sanity.feature_id is required when sae.source is neuronpedia")
+        assert decoder.shape == (n_features_total, d_model), (
+            f"decoder.shape {decoder.shape} != (n_features_total={n_features_total}, d_model={d_model})"
+        )
+        assert 0 <= feature_id < decoder.shape[0], (
+            f"feature_id {feature_id} out of range [0, {decoder.shape[0]})"
+        )
+        v_f = decoder[feature_id].clone()
+        # Log key info for reproducibility
+        logger.info(f"NPZ path: {meta['npz_path']}")
+        logger.info(f"Chosen key: {meta['chosen_key']}")
+        logger.info(f"feature_id: {feature_id}")
+        logger.info(f"v_f.shape: {v_f.shape}, v_f.norm(): {v_f.norm().item():.6f}")
+        return v_f
+    else:
+        return _make_placeholder(config, model, hook_point_module)
 
 
 def create_steering_hook(v_f: torch.Tensor, alpha: float, device: str):

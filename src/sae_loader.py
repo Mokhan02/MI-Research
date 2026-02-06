@@ -159,6 +159,7 @@ def load_gemmascope_decoder(cfg: dict) -> Tuple[torch.Tensor, dict]:
     npz_keys = list(data.keys())
 
     metadata = {
+        "npz_path": npz_path,
         "npz_keys": npz_keys,
         "chosen_key": chosen_key,
         "transposed": transposed,
