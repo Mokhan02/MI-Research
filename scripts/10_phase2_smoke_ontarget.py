@@ -81,6 +81,22 @@ def main():
     config = resolve_config(config, args.run_id)
     save_resolved_config(config, args.run_id)
 
+    sanity = config.get("sanity", {}) or {}
+    feature_ids = sanity.get("feature_ids", None)
+    feature_id_single = sanity.get("feature_id", None)
+
+    if feature_ids is None:
+        if feature_id_single is None:
+            raise ValueError("No feature ids provided. Set sanity.feature_ids (list[int]) or sanity.feature_id (int).")
+        feature_ids = [feature_id_single]
+
+    # defensive: allow comma-separated string if someone messes up YAML later
+    if isinstance(feature_ids, str):
+        feature_ids = [int(x.strip()) for x in feature_ids.split(",") if x.strip()]
+
+    if not isinstance(feature_ids, list) or not all(isinstance(x, int) for x in feature_ids):
+        raise TypeError(f"sanity.feature_ids must be a list[int]. Got: {type(feature_ids)} -> {feature_ids}")
+
     topic = args.topic
     keywords = TOPIC_KEYWORDS[topic]
     run_id = config["experiment"]["run_id"]
@@ -116,13 +132,6 @@ def main():
         f"decoder.shape {decoder.shape} != ({n_features_total}, {d_model})"
     )
 
-    sanity = config.get("sanity", {})
-    feature_ids = sanity.get("feature_ids")
-    if feature_ids is None:
-        fid = sanity.get("feature_id")
-        if fid is None:
-            raise ValueError("Config must set sanity.feature_ids (list) or sanity.feature_id")
-        feature_ids = [fid]
     for fid in feature_ids:
         assert 0 <= fid < decoder.shape[0], f"feature_id {fid} out of range [0, {decoder.shape[0]})"
 
