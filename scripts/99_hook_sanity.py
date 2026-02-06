@@ -19,56 +19,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.config import load_config, resolve_config, save_resolved_config
 from src.model_utils import load_model
+from src.hook_resolver import resolve_hook_point
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def find_hook_point(model, hook_point_name: str) -> torch.nn.Module:
-    """
-    Find the module at the specified hook point.
-    
-    Args:
-        model: The model to search
-        hook_point_name: Name or partial name of the hook point
-    
-    Returns:
-        The module at the hook point
-    
-    Raises:
-        ValueError: If hook point not found, with suggestions
-    """
-    # Get all named modules
-    named_modules = dict(model.named_modules())
-    
-    # Try exact match first
-    if hook_point_name in named_modules:
-        logger.info(f"Found exact match for hook_point: {hook_point_name}")
-        return named_modules[hook_point_name]
-    
-    # Try partial matches
-    matches = [name for name in named_modules.keys() if hook_point_name in name]
-    
-    if len(matches) == 1:
-        logger.info(f"Found unique partial match: {matches[0]}")
-        return named_modules[matches[0]]
-    elif len(matches) > 1:
-        raise ValueError(
-            f"Hook point '{hook_point_name}' matches multiple modules:\n"
-            + "\n".join(f"  - {m}" for m in matches[:10])
-            + f"\n\nPlease specify the exact hook point name."
-        )
-    else:
-        # Find close matches (simple string similarity)
-        all_names = list(named_modules.keys())
-        # Show some example names
-        examples = [name for name in all_names if any(x in name.lower() for x in ["layer", "mlp", "attn", "embed"])][:10]
-        raise ValueError(
-            f"Hook point '{hook_point_name}' not found.\n"
-            f"Example module names:\n"
-            + "\n".join(f"  - {name}" for name in examples)
-            + f"\n\nTotal modules: {len(all_names)}"
-        )
 
 
 def get_feature_vector(config: dict, model, hook_point_module: torch.nn.Module) -> torch.Tensor:
@@ -259,10 +213,10 @@ def main():
     model, tokenizer = load_model(config)
     device = config["model"]["device"]
     
-    # Find hook point module
-    logger.info(f"\nFinding hook point: {hook_point_name}")
-    hook_point_module = find_hook_point(model, hook_point_name)
-    logger.info(f"Found module: {type(hook_point_module).__name__}")
+    # Resolve hook point (TransformerLens -> HuggingFace if needed)
+    logger.info(f"\nResolving hook point: {hook_point_name}")
+    hook_point_module = resolve_hook_point(model, hook_point_name)
+    logger.info(f"Resolved module: {type(hook_point_module).__name__}")
     
     # Get feature vector
     logger.info("\nGetting feature vector v_f...")
