@@ -10,6 +10,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import sys
 from collections import defaultdict
 
@@ -31,7 +32,7 @@ ALPHA_GRID = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0]
 # One topic per run. Keywords are bucket-specific for on-target score.
 TOPIC_KEYWORDS = {
     "capitals": ["paris", "france", "capital", "city"],
-    "arithmetic": ["equals", "=", "sum", "plus", "minus", "times", "divided", "0", "1", "3", "4", "5", "6", "7", "8", "9"],
+    "arithmetic": ["equals", "sum", "plus", "minus", "times", "divided"],
     "planets": [k for k in ["jupiter", "planet", "solar", "saturn", "mars", "earth"] if k != "p"],
 }
 VALID_TOPICS = list(TOPIC_KEYWORDS.keys())
@@ -67,6 +68,18 @@ def _on_target_score(completion: str, prompt: str, keywords: list) -> float:
     if not keywords_not_in_prompt:
         return 0.0  # all keywords were in the prompt; nothing to score on
     return 1.0 if any(kw in completion_lower for kw in keywords_not_in_prompt) else 0.0
+
+
+def _on_target_score_arithmetic_hard(text: str) -> float:
+    """
+    Harder arithmetic score: equation-like pattern in output.
+    Score 1.0 if text matches \\d+ [op] \\d+ or \\d+ = \\d+ (avoids garbage hits).
+    """
+    if re.search(r"\b\d+\s*[+\-*/]\s*\d+\b", text):
+        return 1.0
+    if re.search(r"\b\d+\s*=\s*\d+\b", text):
+        return 1.0
+    return 0.0
 
 
 def main():
@@ -148,6 +161,29 @@ def main():
     temperature = config["model"].get("temperature", 0.0)
     do_sample = config["model"].get("do_sample", False)
 
+    # Headroom: baseline with sampling (temp=1.0, top_p=0.9) to see how often model is already on-target
+    logger.info("Headroom baseline: running each prompt once with temperature=1.0, top_p=0.9 (no steering)...")
+    headroom_scores = []
+    with torch.no_grad():
+        for prompt in prompts:
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                temperature=1.0,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            if topic == "arithmetic":
+                s = _on_target_score_arithmetic_hard(generated)
+            else:
+                s = _on_target_score(generated, prompt, keywords)
+            headroom_scores.append(s)
+    headroom_mean = sum(headroom_scores) / len(headroom_scores) if headroom_scores else 0.0
+    logger.info(f"Headroom baseline (sampling): mean on-target rate = {headroom_mean:.1%} over {len(prompts)} prompts")
+
     out_dir = os.path.join(repo_root, "outputs", "phase2_smoke")
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, f"ontarget_curve_{topic}.csv")
@@ -176,7 +212,10 @@ def main():
                                 pad_token_id=tokenizer.pad_token_id,
                             )
                         generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                        score = _on_target_score(generated, prompt, keywords)
+                        if topic == "arithmetic":
+                            score = _on_target_score_arithmetic_hard(generated)
+                        else:
+                            score = _on_target_score(generated, prompt, keywords)
                         row = {
                             "feature_id": feature_id,
                             "alpha": alpha,
