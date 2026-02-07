@@ -119,6 +119,7 @@ def main():
                     last_pos = resid[batch_dim, last_idx, :]  # (batch, d_model)
                 else:
                     last_pos = resid[:, -1, :]  # (batch, d_model)
+                last_pos = last_pos.float()  # match W_dec (float32) when model is bfloat16
                 acts = last_pos @ W_dec.T  # (batch, n_features)
                 acts_list.append(acts)
         return torch.cat(acts_list, dim=0)  # (n_prompts, n_features)
