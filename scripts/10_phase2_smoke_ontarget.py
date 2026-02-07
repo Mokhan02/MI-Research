@@ -32,7 +32,7 @@ ALPHA_GRID = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0]
 TOPIC_KEYWORDS = {
     "capitals": ["paris", "france", "capital", "city"],
     "arithmetic": ["equals", "=", "sum", "plus", "minus", "times", "divided", "0", "1", "3", "4", "5", "6", "7", "8", "9"],
-    "planets": ["jupiter", "planet", "solar", "saturn", "mars", "earth"],
+    "planets": [k for k in ["jupiter", "planet", "solar", "saturn", "mars", "earth"] if k != "p"],
 }
 VALID_TOPICS = list(TOPIC_KEYWORDS.keys())
 
@@ -142,41 +142,50 @@ def main():
     out_dir = os.path.join(repo_root, "outputs", "phase2_smoke")
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, f"ontarget_curve_{topic}.csv")
-
+    fieldnames = ["feature_id", "alpha", "score", "prompt_idx", "run_id", "topic"]
+    total = len(feature_ids) * len(ALPHA_GRID) * len(prompts)
+    done = 0
     rows = []
-    for feature_id in feature_ids:
-        v_f = decoder[feature_id].clone()
-        for alpha in ALPHA_GRID:
-            hook_fn = _steering_hook_fn(v_f, alpha, device)
-            handle = hook_point_module.register_forward_hook(hook_fn)
-            try:
-                for prompt_idx, prompt in enumerate(prompts):
-                    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=max_new_tokens,
-                            temperature=temperature if do_sample else None,
-                            do_sample=do_sample,
-                            pad_token_id=tokenizer.pad_token_id,
-                        )
-                    generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    score = _on_target_score(generated, prompt, keywords)
-                    rows.append({
-                        "feature_id": feature_id,
-                        "alpha": alpha,
-                        "score": score,
-                        "prompt_idx": prompt_idx,
-                        "run_id": run_id,
-                        "topic": topic,
-                    })
-            finally:
-                handle.remove()
 
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["feature_id", "alpha", "score", "prompt_idx", "run_id", "topic"])
-        w.writeheader()
-        w.writerows(rows)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for feature_id in feature_ids:
+            v_f = decoder[feature_id].clone()
+            for alpha in ALPHA_GRID:
+                hook_fn = _steering_hook_fn(v_f, alpha, device)
+                handle = hook_point_module.register_forward_hook(hook_fn)
+                try:
+                    for prompt_idx, prompt in enumerate(prompts):
+                        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                        with torch.no_grad():
+                            outputs = model.generate(
+                                **inputs,
+                                max_new_tokens=max_new_tokens,
+                                temperature=temperature if do_sample else None,
+                                do_sample=do_sample,
+                                pad_token_id=tokenizer.pad_token_id,
+                            )
+                        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                        score = _on_target_score(generated, prompt, keywords)
+                        row = {
+                            "feature_id": feature_id,
+                            "alpha": alpha,
+                            "score": score,
+                            "prompt_idx": prompt_idx,
+                            "run_id": run_id,
+                            "topic": topic,
+                        }
+                        rows.append(row)
+                        writer.writerow(row)
+                        done += 1
+                        if done % 25 == 0:
+                            logger.info(f"progress {done}/{total} (fid={feature_id}, alpha={alpha}, prompt_idx={prompt_idx})")
+                        if done % 50 == 0:
+                            f.flush()
+                finally:
+                    handle.remove()
+
     logger.info(f"Wrote {len(rows)} rows to {csv_path}")
 
     # Delta-over-baseline summary: mean(score) per (feature_id, alpha), delta vs alpha=0
