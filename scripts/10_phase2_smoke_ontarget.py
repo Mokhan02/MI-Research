@@ -75,6 +75,12 @@ def main():
     parser.add_argument("--run-id", type=str, default="phase2_smoke", help="Run identifier")
     parser.add_argument("--topic", type=str, required=True, choices=VALID_TOPICS,
                         help="Topic bucket: capitals, arithmetic, or planets. One topic per run.")
+    parser.add_argument("--max-prompts", type=int, default=10,
+                        help="Cap number of prompts used (None = all).")
+    parser.add_argument("--max-features", type=int, default=None,
+                        help="Cap number of features used (None = all).")
+    parser.add_argument("--max-new-tokens", type=int, default=32,
+                        help="Max new tokens to generate per sample.")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -96,6 +102,8 @@ def main():
 
     if not isinstance(feature_ids, list) or not all(isinstance(x, int) for x in feature_ids):
         raise TypeError(f"sanity.feature_ids must be a list[int]. Got: {type(feature_ids)} -> {feature_ids}")
+    if args.max_features is not None:
+        feature_ids = feature_ids[: args.max_features]
 
     topic = args.topic
     keywords = TOPIC_KEYWORDS[topic]
@@ -114,6 +122,8 @@ def main():
         prompts = [line.strip() for line in f if line.strip()]
     if not prompts:
         raise ValueError(f"No prompts in {prompts_path}")
+    if args.max_prompts is not None:
+        prompts = prompts[: args.max_prompts]
     logger.info(f"Topic: {topic}, prompts: {len(prompts)}, keywords: {keywords}")
 
     logger.info("Loading model and tokenizer...")
@@ -135,7 +145,6 @@ def main():
     for fid in feature_ids:
         assert 0 <= fid < decoder.shape[0], f"feature_id {fid} out of range [0, {decoder.shape[0]})"
 
-    max_new_tokens = 64
     temperature = config["model"].get("temperature", 0.0)
     do_sample = config["model"].get("do_sample", False)
 
@@ -161,7 +170,7 @@ def main():
                         with torch.no_grad():
                             outputs = model.generate(
                                 **inputs,
-                                max_new_tokens=max_new_tokens,
+                                max_new_tokens=args.max_new_tokens,
                                 temperature=temperature if do_sample else None,
                                 do_sample=do_sample,
                                 pad_token_id=tokenizer.pad_token_id,
