@@ -39,8 +39,11 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 2 prefilter: arithmetic activation lift vs control")
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Config file path")
     parser.add_argument("--run-id", type=str, default="phase2_prefilter", help="Run identifier")
+    parser.add_argument("--topic", type=str, default="arithmetic", help="Topic for target prompts (file: phase2_{topic}.txt)")
+    parser.add_argument("--max-prompts", type=int, default=None, help="Cap both arith and ctrl prompts to this many")
     parser.add_argument("--max-arith", type=int, default=None, help="Cap arithmetic prompts (None = all)")
     parser.add_argument("--max-ctrl", type=int, default=None, help="Cap control prompts (None = all)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for forward pass")
     parser.add_argument("--top-k", type=int, default=50, help="Number of top features by lift to output")
     parser.add_argument("--eps", type=float, default=1e-6, help="Epsilon for ratio (mean_arith+eps)/(mean_ctrl+eps)")
     parser.add_argument("--out", type=str, default=None, help="Output CSV path (default: outputs/phase2_smoke/prefilter_lift.csv)")
@@ -50,15 +53,18 @@ def main():
     config = resolve_config(config, args.run_id)
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    arith_path = os.path.join(repo_root, "data", "prompts", "phase2_arithmetic.txt")
+    arith_path = os.path.join(repo_root, "data", "prompts", f"phase2_{args.topic}.txt")
     ctrl_path = os.path.join(repo_root, "data", "prompts", "phase2_control.txt")
     arith_prompts = _load_prompts(arith_path)
     ctrl_prompts = _load_prompts(ctrl_path)
+    if args.max_prompts is not None:
+        arith_prompts = arith_prompts[: args.max_prompts]
+        ctrl_prompts = ctrl_prompts[: args.max_prompts]
     if args.max_arith is not None:
         arith_prompts = arith_prompts[: args.max_arith]
     if args.max_ctrl is not None:
         ctrl_prompts = ctrl_prompts[: args.max_ctrl]
-    logger.info(f"Arithmetic prompts: {len(arith_prompts)}, control prompts: {len(ctrl_prompts)}")
+    logger.info(f"Topic: {args.topic}, arithmetic prompts: {len(arith_prompts)}, control prompts: {len(ctrl_prompts)}, batch_size: {args.batch_size}")
 
     logger.info("Loading model and tokenizer...")
     model, tokenizer = load_model(config)
@@ -85,27 +91,43 @@ def main():
 
     handle = hook_point_module.register_forward_hook(hook_fn)
 
-    def get_feature_acts_for_prompts(prompts: list[str]) -> torch.Tensor:
-        """Run forward on each prompt, capture resid at last position, project to features. Return (n_prompts, n_features)."""
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    def get_feature_acts_for_prompts(prompts: list[str], batch_size: int) -> torch.Tensor:
+        """Run forward in batches, capture resid at last valid position per sequence, project to features. Return (n_prompts, n_features)."""
         acts_list = []
         with torch.no_grad():
-            for prompt in prompts:
+            for i in range(0, len(prompts), batch_size):
+                batch_prompts = prompts[i : i + batch_size]
                 captured.clear()
-                inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                inputs = tokenizer(
+                    batch_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                ).to(device)
                 model(**inputs)
                 if not captured:
                     raise RuntimeError("Hook did not capture activations")
                 resid = captured[0]  # (batch, seq, d_model)
-                last_pos = resid[:, -1, :]  # (batch, d_model)
+                attn = inputs.get("attention_mask")
+                if attn is not None:
+                    last_idx = attn.sum(dim=1) - 1  # (batch,)
+                    batch_dim = torch.arange(resid.shape[0], device=resid.device)
+                    last_pos = resid[batch_dim, last_idx, :]  # (batch, d_model)
+                else:
+                    last_pos = resid[:, -1, :]  # (batch, d_model)
                 acts = last_pos @ W_dec.T  # (batch, n_features)
                 acts_list.append(acts)
         return torch.cat(acts_list, dim=0)  # (n_prompts, n_features)
 
     try:
         logger.info("Computing feature activations on arithmetic prompts...")
-        arith_acts = get_feature_acts_for_prompts(arith_prompts)  # (n_arith, n_features)
+        arith_acts = get_feature_acts_for_prompts(arith_prompts, args.batch_size)  # (n_arith, n_features)
         logger.info("Computing feature activations on control prompts...")
-        ctrl_acts = get_feature_acts_for_prompts(ctrl_prompts)  # (n_ctrl, n_features)
+        ctrl_acts = get_feature_acts_for_prompts(ctrl_prompts, args.batch_size)  # (n_ctrl, n_features)
     finally:
         handle.remove()
 
