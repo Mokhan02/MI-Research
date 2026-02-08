@@ -59,6 +59,7 @@ experiment:
 # Sanity check (hook sanity script)
 sanity:
   feature_id: 2263  # Neuronpedia feature index for first real run
+  feature_ids: [2317, 8978, 15199, 2713, 10792, 4378, 5441, 8195, 14537, 14885]
 
 # Verification checklist (see docs/target.md)
 # [ ] confirm hook_point naming from SAE metadata

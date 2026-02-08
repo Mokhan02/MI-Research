@@ -1,9 +1,11 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 # scripts/11b_phase2_prefilter_logit.py
 import argparse
-from pathlib import Path
 import pandas as pd
 import torch
-
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
 from src.sae_loader import load_gemmascope_decoder
