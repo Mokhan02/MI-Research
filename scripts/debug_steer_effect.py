@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +17,13 @@ def _get_main_tensor(outp):
     return outp[0] if isinstance(outp, tuple) else outp
 
 
+def feature_act_from_resid(resid_lastpos: torch.Tensor, fid: int, W_enc_feat: torch.Tensor, b_enc: torch.Tensor, thr: torch.Tensor) -> torch.Tensor:
+    """SAE activation for one feature at last position: z = x @ W_enc[fid] + b_enc[fid], a_f = relu(z - thr[fid])."""
+    # resid_lastpos: (d_model,); W_enc_feat[fid]: (d_model,)
+    z = (resid_lastpos @ W_enc_feat[fid]) + b_enc[fid]
+    return torch.relu(z - thr[fid])
+
+
 def main():
     cfg_path = "configs/targets/gemma2_2b_gemmascope_res16k.yaml"
     run_id = "debug_steer_effect"
@@ -24,77 +32,103 @@ def main():
     model, tokenizer = load_model(config)
     model.eval()
     device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
 
     hook_name = config["sae"]["hook_point"]  # e.g. blocks.20.hook_resid_post
     hook_module = resolve_hook_point(model, hook_name)
 
-    decoder, _meta = load_gemmascope_decoder(config)
-    decoder = decoder.to(device)
+    # Load decoder and NPZ for encoder + bias + threshold
+    decoder, meta = load_gemmascope_decoder(config)
+    npz_path = meta["npz_path"]
+    data = np.load(npz_path)
+    W_dec = np.asarray(data["W_dec"], dtype=np.float32)   # (n_features, d_model)
+    W_enc = np.asarray(data["W_enc"], dtype=np.float32)
+    b_enc = np.asarray(data["b_enc"], dtype=np.float32)   # (n_features,)
+    thr = np.asarray(data["threshold"], dtype=np.float32)  # (n_features,)
+    if W_enc.shape[0] != W_dec.shape[0] and W_enc.shape[1] == W_dec.shape[1]:
+        W_enc_feat = W_enc  # (n_features, d_model)
+    elif W_enc.shape[0] == W_dec.shape[1]:
+        W_enc_feat = W_enc.T  # (d_model, n_features) -> (n_features, d_model)
+    else:
+        raise ValueError(f"Unexpected W_enc shape {W_enc.shape}, W_dec shape {W_dec.shape}")
+    W_enc_feat = torch.tensor(W_enc_feat, device=device, dtype=model_dtype)
+    b_enc = torch.tensor(b_enc, device=device, dtype=model_dtype)
+    thr = torch.tensor(thr, device=device, dtype=model_dtype)
+    decoder = torch.tensor(W_dec, device=device, dtype=model_dtype)
 
-    # ---- single prompt ----
     prompt = "One plus one equals"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    # ---- choose feature/alpha to test ----
     fid = 14885
-    alpha = 5.0
+    target_text = " two"
+    target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+    if len(target_ids) != 1:
+        raise ValueError(f"Target {target_text!r} must be single token, got ids={target_ids}")
+    tid = target_ids[0]
 
-    # ---- baseline logits for next token ----
-    with torch.no_grad():
-        out = model(**inputs)
-        base_logits = out.logits[0, -1].float()
+    ALPHAS = [0.0, 0.25, 0.5, 1.0, -1.0]
+    captured_resid = []
 
-    # ---- steered logits for next token ----
-    def hook_fn(module, inp, outp):
-        t = _get_main_tensor(outp)  # [batch, seq, d_model]
-        vec = decoder[fid].to(device=device, dtype=t.dtype)
-        t2 = t.clone()
-        t2[:, -1, :] = t2[:, -1, :] + alpha * vec
-        if isinstance(outp, tuple):
-            return (t2,) + outp[1:]
-        return t2
+    def make_hook(alpha_val):
+        def hook_fn(module, inp, outp):
+            t = _get_main_tensor(outp)  # [batch, seq, d_model]
+            vec = decoder[fid].to(device=device, dtype=t.dtype)
+            t2 = t.clone()
+            t2[:, -1, :] = t2[:, -1, :] + alpha_val * vec
+            captured_resid.append(t2.detach())
+            if isinstance(outp, tuple):
+                return (t2,) + outp[1:]
+            return t2
+        return hook_fn
 
-    handle = hook_module.register_forward_hook(hook_fn)
-    with torch.no_grad():
-        out2 = model(**inputs)
-        steered_logits = out2.logits[0, -1].float()
-    handle.remove()
-
-    # ---- compare: overall logit movement ----
-    diff = (steered_logits - base_logits).abs()
     print("PROMPT:", repr(prompt))
     print("hook_point:", hook_name)
-    print("feature_id:", fid, "alpha:", alpha)
-    print("Mean |Δlogit|:", diff.mean().item())
-    print("Max  |Δlogit|:", diff.max().item())
+    print("feature_id:", fid)
+    print("target token:", repr(target_text), "id:", tid)
+    print()
+    print("alpha     act(fid)    logit(' two')")
+    print("-" * 40)
 
-    # ---- compare: does it boost the CORRECT answer token? ----
-    # Try a few candidate strings because tokenization can differ ("2" vs " 2")
-    cands = ["2", " two", " three", " one", " four", " five"]
-    pb = F.softmax(base_logits, dim=-1)
-    ps = F.softmax(steered_logits, dim=-1)
+    results = []
+    for alpha in ALPHAS:
+        captured_resid.clear()
+        handle = hook_module.register_forward_hook(make_hook(alpha))
+        with torch.no_grad():
+            out = model(**inputs)
+            logits = out.logits[0, -1].float()
+        handle.remove()
+        if not captured_resid:
+            raise RuntimeError("Hook did not capture residual")
+        resid_last = captured_resid[0][0, -1, :]  # (d_model,)
+        act = feature_act_from_resid(resid_last, fid, W_enc_feat, b_enc, thr)
+        logit_two = logits[tid].item()
+        results.append((alpha, act.item(), logit_two))
+    base_logit_two = next(l for a, _, l in results if a == 0.0)
+    for alpha, act_val, logit_two in results:
+        delta = logit_two - base_logit_two
+        print(f"alpha={alpha:+.2f}  act(fid)={act_val:.6f}  logit({target_text!r})={logit_two:+.4f}  Δlogit={delta:+.4f}")
 
-    print("\nCorrect-token probability probe:")
-    for s in cands:
-        ids = tokenizer.encode(s, add_special_tokens=False)
-        if len(ids) == 1:
-            tid = ids[0]
-            p0 = pb[tid].item()
-            p1 = ps[tid].item()
-            ratio = p1 / (p0 + 1e-12)
-            print(f"  cand={s!r:6} token={tid:<7} P_base={p0:.6e}  P_steer={p1:.6e}  ratio={ratio:.2f}x")
-        else:
-            print(f"  cand={s!r:6} -> multi-token ids={ids} (skip)")
+    # ---- optional: show top tokens at alpha=0 and alpha=1 for comparison ----
+    captured_resid.clear()
+    handle = hook_module.register_forward_hook(make_hook(0.0))
+    with torch.no_grad():
+        out_base = model(**inputs)
+        base_logits = out_base.logits[0, -1].float()
+    handle.remove()
+    captured_resid.clear()
+    handle = hook_module.register_forward_hook(make_hook(1.0))
+    with torch.no_grad():
+        out_steer = model(**inputs)
+        steered_logits = out_steer.logits[0, -1].float()
+    handle.remove()
 
-    # ---- show top tokens baseline vs steered ----
     def show_top(logits, title):
         top = torch.topk(logits, k=10)
         print(f"\n{title} top-10 next tokens:")
         for v, i in zip(top.values.tolist(), top.indices.tolist()):
             print(f"  logit={v:+.4f}  id={i:<7} text={tokenizer.decode([i])!r}")
 
-    show_top(base_logits, "BASE")
-    show_top(steered_logits, "STEERED")
+    show_top(base_logits, "BASE (alpha=0)")
+    show_top(steered_logits, "STEERED (alpha=+1.0)")
 
 
 if __name__ == "__main__":
