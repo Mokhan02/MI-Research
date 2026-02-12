@@ -67,7 +67,7 @@ def main():
         raise ValueError(f"Target {target_text!r} must be single token, got ids={target_ids}")
     tid = target_ids[0]
 
-    ALPHAS = [0.0, 1.0, 2.0, 5.0, -5.0]
+    ALPHAS = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, -1.0, -2.0, -5.0]
     captured_resid = []
 
     def make_hook(alpha_val):
