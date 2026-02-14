@@ -26,6 +26,12 @@ def set_determinism(seed: int = 1234):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
+def nanmean_or_nan(x):
+    """Mean of finite values, or NaN if none. No RuntimeWarning on empty slice."""
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    return float(x.mean()) if len(x) > 0 else np.nan
+
 def tv_distance_from_logits(logits_a: torch.Tensor, logits_b: torch.Tensor) -> float:
     p = F.softmax(logits_a, dim=-1)
     q = F.softmax(logits_b, dim=-1)
@@ -97,48 +103,134 @@ def encode_target(tokenizer, t):
     ids = tokenizer.encode(t, add_special_tokens=False)
     return ids[0] if len(ids) == 1 else None
 
+def _find_alpha_star(df_direction, prompts, threshold_fn, alphas_ordered):
+    """
+    Scan alphas in order of increasing |alpha|.  For each prompt, find the
+    first alpha where threshold_fn(delta) is True.
+
+    Returns: dict  prompt_idx -> (alpha_star, tv_at_crossing)
+    Both values come from the SAME run_rows row.
+    """
+    # Index df by (prompt_idx, alpha) for fast lookup
+    keyed = df_direction.set_index(["prompt_idx", "alpha"])
+    hits = {}
+    for pidx in prompts:
+        for a in alphas_ordered:
+            if (pidx, a) not in keyed.index:
+                continue
+            row = keyed.loc[(pidx, a)]
+            # row could be a Series (single match) or DataFrame (shouldn't happen
+            # with unique (prompt, feature, alpha) but be safe)
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            if threshold_fn(row["delta_logit_target"]):
+                hits[pidx] = (abs(a), row["tv_distance"])
+                break
+    return hits
+
+def _monotone_fraction(df_direction, prompts, alphas_ordered, sign=1):
+    """
+    For each prompt, check how many consecutive alpha steps show
+    delta moving in the expected direction (sign=+1: increasing, sign=-1: decreasing).
+    Returns fraction of prompts with >= 2/3 monotone steps.
+    """
+    keyed = df_direction.set_index(["prompt_idx", "alpha"])
+    n_mono_prompts = 0
+    n_total = 0
+    for pidx in prompts:
+        deltas = []
+        for a in alphas_ordered:
+            if (pidx, a) not in keyed.index:
+                continue
+            row = keyed.loc[(pidx, a)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            deltas.append(row["delta_logit_target"])
+        if len(deltas) < 2:
+            continue
+        n_total += 1
+        n_steps = len(deltas) - 1
+        monotone_steps = sum(
+            1 for i in range(n_steps)
+            if sign * (deltas[i + 1] - deltas[i]) >= 0
+        )
+        if monotone_steps >= (2 * n_steps / 3):
+            n_mono_prompts += 1
+    return n_mono_prompts / n_total if n_total > 0 else np.nan
+
 def summarize_feature_directional(df_feat, tau: float):
     """
-    df_feat: run_rows filtered to a single feature_id (all prompts, all alphas)
-    Returns dict with directional success rates and alpha* means (positive alphas only).
-    """
-    # Only positive alphas for alpha* definition
-    pos = df_feat[df_feat["alpha"] > 0].copy()
+    df_feat: run_rows filtered to a single feature_id (all prompts, all alphas).
 
-    # If no positive alphas exist, bail
-    if len(pos) == 0:
-        return dict(
-            success_rate_up=0.0,
-            success_rate_down=0.0,
-            alpha_star_mean_up=np.nan,
-            alpha_star_mean_down=np.nan,
+    Directional convention:
+      - success_up   uses positive alphas:  delta_logit_target >= +tau
+      - success_down uses negative alphas:  delta_logit_target <= -tau
+
+    alpha_star is found by explicit scan in order of increasing |alpha|.
+    tv_at_alpha_star comes from the exact same (prompt, feature, alpha) row.
+
+    Also computes sign consistency (monotone_frac_up/down): fraction of
+    prompts where >= 2/3 of consecutive alpha steps are monotone in the
+    expected direction.
+    """
+    pos = df_feat[df_feat["alpha"] > 0].copy()
+    neg = df_feat[df_feat["alpha"] < 0].copy()
+    prompts = df_feat["prompt_idx"].unique()
+
+    # Explicit alpha orderings by increasing |alpha|
+    pos_alphas = sorted(pos["alpha"].unique(), key=lambda a: abs(a))
+    neg_alphas = sorted(neg["alpha"].unique(), key=lambda a: abs(a))
+
+    result = dict(
+        success_rate_up=0.0,
+        success_rate_down=0.0,
+        alpha_star_mean_up=np.nan,
+        alpha_star_mean_down=np.nan,
+        tv_at_alpha_star_up=np.nan,
+        tv_at_alpha_star_down=np.nan,
+        monotone_frac_up=np.nan,
+        monotone_frac_down=np.nan,
+    )
+
+    # --- UP direction (positive alphas, delta >= +tau) ---
+    if len(pos) > 0:
+        mx = pos.groupby("prompt_idx")["delta_logit_target"].max()
+        succ_up = (mx >= tau)
+        result["success_rate_up"] = float(succ_up.mean())
+
+        hits_up = _find_alpha_star(
+            pos, prompts,
+            threshold_fn=lambda d: d >= tau,
+            alphas_ordered=pos_alphas,
+        )
+        if hits_up:
+            result["alpha_star_mean_up"] = nanmean_or_nan([v[0] for v in hits_up.values()])
+            result["tv_at_alpha_star_up"] = nanmean_or_nan([v[1] for v in hits_up.values()])
+
+        result["monotone_frac_up"] = _monotone_fraction(
+            pos, prompts, pos_alphas, sign=+1,
         )
 
-    # Per (prompt) maxima/minima over positive alphas
-    g = pos.groupby("prompt_idx")["delta_logit_target"]
-    mx = g.max()  # best upward push achievable
-    mn = g.min()  # best downward push achievable
+    # --- DOWN direction (negative alphas, delta <= -tau) ---
+    if len(neg) > 0:
+        mn = neg.groupby("prompt_idx")["delta_logit_target"].min()
+        succ_down = (mn <= -tau)
+        result["success_rate_down"] = float(succ_down.mean())
 
-    succ_up = (mx >= tau)
-    succ_down = (mn <= -tau)
+        hits_down = _find_alpha_star(
+            neg, prompts,
+            threshold_fn=lambda d: d <= -tau,
+            alphas_ordered=neg_alphas,  # [-1, -2, -5, ...] by increasing |alpha|
+        )
+        if hits_down:
+            result["alpha_star_mean_down"] = nanmean_or_nan([v[0] for v in hits_down.values()])
+            result["tv_at_alpha_star_down"] = nanmean_or_nan([v[1] for v in hits_down.values()])
 
-    # alpha* per prompt: smallest alpha that hits the threshold
-    hit_up_rows = pos[pos["delta_logit_target"] >= tau]
-    hit_down_rows = pos[pos["delta_logit_target"] <= -tau]
+        result["monotone_frac_down"] = _monotone_fraction(
+            neg, prompts, neg_alphas, sign=-1,
+        )
 
-    alpha_star_up = hit_up_rows.groupby("prompt_idx")["alpha"].min()
-    alpha_star_down = hit_down_rows.groupby("prompt_idx")["alpha"].min()
-
-    # Means over prompts where success occurred
-    alpha_star_mean_up = alpha_star_up.mean() if len(alpha_star_up) > 0 else np.nan
-    alpha_star_mean_down = alpha_star_down.mean() if len(alpha_star_down) > 0 else np.nan
-
-    return dict(
-        success_rate_up=float(succ_up.mean()),
-        success_rate_down=float(succ_down.mean()),
-        alpha_star_mean_up=float(alpha_star_mean_up) if not np.isnan(alpha_star_mean_up) else np.nan,
-        alpha_star_mean_down=float(alpha_star_mean_down) if not np.isnan(alpha_star_mean_down) else np.nan,
-    )
+    return result
 
 # --------------------------
 # Main
@@ -154,7 +246,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--tau", type=float, default=0.5)
     ap.add_argument("--topk", type=int, default=50)
-    ap.add_argument("--alphas", type=str, default="0,1,2,5,10,20,40")
+    ap.add_argument("--alphas", type=str, default="-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
     args = ap.parse_args()
 
     set_determinism(args.seed)
@@ -234,6 +326,11 @@ def main():
                 kl = kl_pq_from_logits(base_logits, steer_logits)
                 jac = topk_jaccard(base_logits, steer_logits, k=args.topk)
 
+                # Stricter metrics: rank change of target token
+                base_rank = int((base_logits >= base_logits[target_id]).sum().item())
+                steer_rank = int((steer_logits >= steer_logits[target_id]).sum().item())
+                target_is_top1 = bool(steer_rank == 1)
+
                 rows.append({
                     "prompt_idx": pi,
                     "feature_id": fid,
@@ -246,6 +343,9 @@ def main():
                     "topk_jaccard": jac,
                     "max_abs_dlogit": max_abs,
                     "hook_ran": bool(hook_ran),
+                    "base_rank": base_rank,
+                    "steer_rank": steer_rank,
+                    "target_is_top1": target_is_top1,
                 })
 
         if (pi + 1) % 10 == 0:
@@ -264,15 +364,36 @@ def main():
     for fid, df_feat in df.groupby("feature_id"):
         d = summarize_feature_directional(df_feat, tau=args.tau)
 
+        # Non-zero alphas for off-target metrics (exclude baseline alpha=0)
+        df_nonzero = df_feat[df_feat["alpha"] != 0.0]
+
+        # Rank-based: at max positive alpha, what fraction of prompts
+        # have target as top-1?
+        max_pos_alpha = max([a for a in alphas if a > 0], default=None)
+        if max_pos_alpha is not None:
+            at_max = df_feat[df_feat["alpha"] == max_pos_alpha]
+            top1_rate_up = float(at_max["target_is_top1"].mean()) if len(at_max) > 0 else np.nan
+        else:
+            top1_rate_up = np.nan
+
+        # Mean rank improvement at max positive alpha
+        if max_pos_alpha is not None and len(at_max) > 0:
+            mean_rank_improve = float((at_max["base_rank"] - at_max["steer_rank"]).mean())
+        else:
+            mean_rank_improve = np.nan
+
         row = {
             "feature_id": fid,
-            # Off-target metrics (all alphas)
-            "tv_mean": df_feat["tv_distance"].mean() if "tv_distance" in df_feat.columns else np.nan,
-            "kl_mean": df_feat["kl_base_to_steer"].mean() if "kl_base_to_steer" in df_feat.columns else np.nan,
-            "maxabs_mean": df_feat["max_abs_dlogit"].mean() if "max_abs_dlogit" in df_feat.columns else np.nan,
-            "jacc_mean": df_feat["topk_jaccard"].mean() if "topk_jaccard" in df_feat.columns else np.nan,
+            # Off-target metrics (non-zero alphas)
+            "tv_mean": df_nonzero["tv_distance"].mean() if len(df_nonzero) > 0 else np.nan,
+            "kl_mean": df_nonzero["kl_base_to_steer"].mean() if len(df_nonzero) > 0 else np.nan,
+            "maxabs_mean": df_nonzero["max_abs_dlogit"].mean() if len(df_nonzero) > 0 else np.nan,
+            "jacc_mean": df_nonzero["topk_jaccard"].mean() if len(df_nonzero) > 0 else np.nan,
             "target_delta_mean": df_feat["delta_logit_target"].mean(),
-            # Directional success/alpha*
+            # Rank-based stricter metrics
+            "top1_rate_up": top1_rate_up,
+            "mean_rank_improve": mean_rank_improve,
+            # Directional success/alpha*/tv_at_crossing/monotone
             **d,
         }
         summary_rows.append(row)
