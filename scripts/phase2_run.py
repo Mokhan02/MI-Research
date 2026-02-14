@@ -176,11 +176,12 @@ def main():
                     "hook_ran": bool(hook_ran),
                 })
 
-                if alpha != 0.0:
+                # Only positive alphas count for alpha_star
+                if alpha > 0.0:
                     if alpha_star_up is None and delta_target >= args.tau:
-                        alpha_star_up = abs(alpha)
+                        alpha_star_up = alpha
                     if alpha_star_down is None and delta_target <= -args.tau:
-                        alpha_star_down = abs(alpha)
+                        alpha_star_down = alpha
 
             alpha_star_rows.append({
                 "prompt_idx": pi,
@@ -199,16 +200,40 @@ def main():
     run_path = os.path.join(args.out_dir, "run_rows.csv")
     df.to_csv(run_path, index=False)
 
-    # Aggregate per feature (directional)
-    feat_alpha = (df_alpha.groupby("feature_id")
-                  .agg(alpha_star_mean_up=("alpha_star_up", "mean"),
-                       alpha_star_median_up=("alpha_star_up", "median"),
-                       success_rate_up=("alpha_star_up", lambda s: float(np.isfinite(s).mean())),
-                       alpha_star_mean_down=("alpha_star_down", "mean"),
-                       alpha_star_median_down=("alpha_star_down", "median"),
-                       success_rate_down=("alpha_star_down", lambda s: float(np.isfinite(s).mean())))
-                  .reset_index())
+    # -----------------------------------------------------------
+    # Aggregate per feature (directional, positive-alpha only)
+    # -----------------------------------------------------------
+    # Step 1: per (prompt, feature) stats from positive alphas
+    df_pos = df[df.alpha > 0].copy()
+    pf = (df_pos.groupby(["prompt_idx", "feature_id"])
+          .agg(mx=("delta_logit_target", "max"),
+               mn=("delta_logit_target", "min"))
+          .reset_index())
+    pf["succ_up"] = pf["mx"] >= args.tau
+    pf["succ_down"] = pf["mn"] <= -args.tau
 
+    # Merge in alpha_star from the per-(prompt,feature) tracking
+    pf = pf.merge(df_alpha, on=["prompt_idx", "feature_id"], how="left")
+
+    # Step 2: aggregate per feature
+    def _agg_feat(g):
+        su = g["succ_up"].mean()
+        sd = g["succ_down"].mean()
+        # alpha_star_mean only over prompts where success occurred
+        up_vals = g.loc[g["succ_up"], "alpha_star_up"]
+        dn_vals = g.loc[g["succ_down"], "alpha_star_down"]
+        amu = up_vals.mean() if len(up_vals) > 0 else np.nan
+        amd = dn_vals.mean() if len(dn_vals) > 0 else np.nan
+        return pd.Series({
+            "success_rate_up": su,
+            "success_rate_down": sd,
+            "alpha_star_mean_up": amu,
+            "alpha_star_mean_down": amd,
+        })
+
+    feat_alpha = pf.groupby("feature_id").apply(_agg_feat).reset_index()
+
+    # Step 3: off-target summary at reference alpha
     alpha_ref = max(alphas, key=lambda a: abs(a))
     df_ref = df[df.alpha == alpha_ref].copy()
     feat_ref = (df_ref.groupby("feature_id")
