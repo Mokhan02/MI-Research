@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import random
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,16 @@ from src.config import load_config, resolve_config
 from src.model_utils import load_model
 from src.hook_resolver import resolve_hook_point
 from src.sae_loader import load_gemmascope_decoder
+
+# Determinism
+SEED = 1234
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.use_deterministic_algorithms(True)
 
 
 def _get_main_tensor(outp):
@@ -20,6 +31,10 @@ def main():
     cfg_path = "configs/targets/gemma2_2b_gemmascope_res16k.yaml"
     run_id = "debug_steer_effect"
     config = resolve_config(load_config(cfg_path), run_id=run_id)
+
+    # Force greedy / no sampling in config
+    config["model"]["do_sample"] = False
+    config["model"]["temperature"] = 0.0
 
     model, tokenizer = load_model(config)
     model.eval()
@@ -82,6 +97,20 @@ def main():
             return t2
         return hook_fn
 
+    def run_once(alpha_val):
+        """Single forward pass with steering. Returns dict with logits, tokens (greedy), resid_last."""
+        captured_resid.clear()
+        handle = hook_module.register_forward_hook(make_hook(alpha_val))
+        with torch.no_grad():
+            out = model(**inputs)
+            logits = out.logits[0, -1].float()  # last position logits, float32
+        handle.remove()
+        if not captured_resid:
+            raise RuntimeError("Hook did not capture residual")
+        resid_last = captured_resid[0][0, -1, :].float()
+        tokens = logits.argmax(dim=-1, keepdim=True)  # greedy next token
+        return {"logits": logits, "tokens": tokens, "resid_last": resid_last}
+
     print()
     print("PROMPT:", repr(prompt))
     print("hook_point:", hook_name)
@@ -89,19 +118,22 @@ def main():
     print("target token:", repr(target_text), "id:", tid)
     print()
 
+    # ---- Determinism check: run twice, assert exact match ----
+    print("=== Determinism check (alpha=1.0, two identical runs) ===")
+    out1 = run_once(1.0)
+    out2 = run_once(1.0)
+    assert (out1["tokens"] == out2["tokens"]).all(), "NON-DETERMINISTIC: greedy token ids differ"
+    torch.testing.assert_close(out1["logits"], out2["logits"], rtol=0, atol=0)
+    print("PASS: logits and tokens are bitwise identical across two runs.")
+    print()
+
     # ---- Run alpha grid, capture resid, compute z/act/logit/projection ----
     results = []
     base_resid_last = None
     for alpha in ALPHAS:
-        captured_resid.clear()
-        handle = hook_module.register_forward_hook(make_hook(alpha))
-        with torch.no_grad():
-            out = model(**inputs)
-            logits = out.logits[0, -1].float()
-        handle.remove()
-        if not captured_resid:
-            raise RuntimeError("Hook did not capture residual")
-        resid_last = captured_resid[0][0, -1, :].float()  # (d_model,) in float32
+        r = run_once(alpha)
+        logits = r["logits"]
+        resid_last = r["resid_last"]
         if alpha == 0.0:
             base_resid_last = resid_last.clone()
         z, act = z_and_act(resid_last, fid)
@@ -136,13 +168,8 @@ def main():
 
     # Re-run for clean top-10 display
     for a_show, label in [(0.0, "BASE (alpha=0)"), (5.0, "STEERED (alpha=+5)")]:
-        captured_resid.clear()
-        handle = hook_module.register_forward_hook(make_hook(a_show))
-        with torch.no_grad():
-            out = model(**inputs)
-            logits = out.logits[0, -1].float()
-        handle.remove()
-        show_top(logits, label)
+        r = run_once(a_show)
+        show_top(r["logits"], label)
 
 
 if __name__ == "__main__":
