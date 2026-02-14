@@ -239,14 +239,17 @@ def run_stratified_correlations(df: pd.DataFrame, y_col: str, x_col: str, q: int
 # --------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase2_dir", type=str, required=True, help="Phase2 output dir (feature_summary.csv)")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--phase2_dir", type=str, help="Phase2 output dir (contains feature_summary.csv)")
+    g.add_argument("--phase2_summary", type=str, help="Path to feature_summary.csv directly")
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
     ap.add_argument("--out_dir", type=str, default="outputs/phase3_predictability")
     ap.add_argument("--tau", type=float, default=0.1, help="Cosine threshold for density_tau")
     ap.add_argument("--chunk_size", type=int, default=256)
     ap.add_argument("--topk", type=int, default=50, help="Top-k for mean_topk_cos")
+    ap.add_argument("--n_prompts", type=int, default=100, help="Max prompts for baseline activation computation")
     ap.add_argument("--skip_baseline", action="store_true", help="Skip baseline activation computation (geometry only)")
-    ap.add_argument("--prompt_csv", type=str, default=None, help="Prompts for baseline; default from phase2 meta or arithmetic_only.csv")
+    ap.add_argument("--prompt_csv", type=str, default=None, help="Prompts for baseline; default arithmetic_only.csv")
     ap.add_argument("--baseline_cache", type=str, default=None, help="Path to load/save baseline_usage.csv")
     ap.add_argument("--run_name", type=str, default="arithmetic", help="Suffix for merged CSV and cache")
     args = ap.parse_args()
@@ -254,8 +257,12 @@ def main():
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     # Load phase2 feature_summary
-    phase2_dir = Path(args.phase2_dir)
-    summary_path = phase2_dir / "feature_summary.csv"
+    if args.phase2_summary:
+        summary_path = Path(args.phase2_summary)
+        phase2_dir = summary_path.parent
+    else:
+        phase2_dir = Path(args.phase2_dir)
+        summary_path = phase2_dir / "feature_summary.csv"
     if not summary_path.exists():
         raise FileNotFoundError(f"Need {summary_path}")
     summary = pd.read_csv(summary_path)
@@ -307,7 +314,7 @@ def main():
             if not Path(prompt_csv).exists():
                 prompt_csv = str(Path(__file__).resolve().parents[1] / "data" / "arithmetic_only.csv")
             dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string"})
-            prompts = dfp["prompt"].dropna().astype(str).tolist()[:100]
+            prompts = dfp["prompt"].dropna().astype(str).tolist()[: args.n_prompts]
             act_freq, mean_act, mean_z_minus_thr = compute_baseline_usage(
                 model, tokenizer, W_enc, b_enc, thr, prompts, device
             )
