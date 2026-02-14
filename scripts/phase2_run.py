@@ -3,11 +3,13 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import os, json, argparse, random
+import os, json, argparse, random, time
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from itertools import product
+from tqdm.auto import tqdm
 
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
@@ -300,69 +302,96 @@ def main():
 
     rows = []
 
-    for pi, prow in dfp.iterrows():
+    # Pre-compute per-prompt baselines (one forward pass each)
+    print(f"Computing baselines for {len(dfp)} prompts...")
+    prompt_cache = {}
+    for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baselines"):
         prompt = prow["prompt"]
         target_id = encode_target(tokenizer, prow.get("target", np.nan))
-
         base_logits, input_ids, base_resid = forward_last_logits(model, tokenizer, prompt)
         seq_len = int(input_ids.shape[0])
         pos = seq_len - 1
-
         if target_id is None:
             target_id = int(torch.argmax(base_logits).item())
+        w_t = lm_head_w[target_id]
+        base_t = torch.dot(base_resid, w_t)
+        prompt_cache[pi] = dict(
+            prompt=prompt, base_logits=base_logits, base_resid=base_resid,
+            seq_len=seq_len, pos=pos, target_id=target_id, w_t=w_t, base_t=base_t,
+        )
 
-        # fp32 baseline target logit from residual
-        w_t = lm_head_w[target_id]  # [d_model] fp32
-        base_t = torch.dot(base_resid, w_t)  # fp32 scalar
+    # Flat iterator over all (prompt, feature, alpha) jobs
+    all_jobs = list(product(dfp.index, feature_ids, alphas_sorted))
+    total_tasks = len(all_jobs)
+    start_time = time.time()
+    last_flush_pi = -1
+    partial_path = os.path.join(args.out_dir, "run_rows_partial.csv")
 
-        for fid in feature_ids:
-            steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
+    print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
 
-            for alpha in alphas_sorted:
-                if alpha == 0.0:
-                    steer_logits = base_logits
-                    steer_resid = base_resid
-                    hook_ran = True
-                else:
-                    mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pos, steer_dir)
-                    steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, prompt, prehook=mk_hook)
-                    hook_ran = cap["ok"]
+    for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering")):
+        pc = prompt_cache[pi]
+        steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
 
-                # fp32 delta_logit_target from residuals
-                steer_t = torch.dot(steer_resid, w_t)
-                delta_target = float((steer_t - base_t).item())
+        if alpha == 0.0:
+            steer_logits = pc["base_logits"]
+            steer_resid = pc["base_resid"]
+            hook_ran = True
+        else:
+            mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pc["pos"], steer_dir)
+            t0 = time.time()
+            steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
+            t1 = time.time()
+            hook_ran = cap["ok"]
+            if (t1 - t0) > 2.0:
+                print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
 
-                # Off-target metrics still from full logits
-                d = steer_logits - base_logits
-                max_abs = float(d.abs().max().item())
-                tv = tv_distance_from_logits(base_logits, steer_logits)
-                kl = kl_pq_from_logits(base_logits, steer_logits)
-                jac = topk_jaccard(base_logits, steer_logits, k=args.topk)
+        # fp32 delta_logit_target from residuals
+        steer_t = torch.dot(steer_resid, pc["w_t"])
+        delta_target = float((steer_t - pc["base_t"]).item())
 
-                # Stricter metrics: rank change of target token
-                base_rank = int((base_logits >= base_logits[target_id]).sum().item())
-                steer_rank = int((steer_logits >= steer_logits[target_id]).sum().item())
-                target_is_top1 = bool(steer_rank == 1)
+        # Off-target metrics still from full logits
+        d = steer_logits - pc["base_logits"]
+        max_abs = float(d.abs().max().item())
+        tv = tv_distance_from_logits(pc["base_logits"], steer_logits)
+        kl = kl_pq_from_logits(pc["base_logits"], steer_logits)
+        jac = topk_jaccard(pc["base_logits"], steer_logits, k=args.topk)
 
-                rows.append({
-                    "prompt_idx": pi,
-                    "feature_id": fid,
-                    "alpha": alpha,
-                    "seq_len": seq_len,
-                    "target_id": int(target_id),
-                    "delta_logit_target": delta_target,
-                    "tv_distance": tv,
-                    "kl_base_to_steer": kl,
-                    "topk_jaccard": jac,
-                    "max_abs_dlogit": max_abs,
-                    "hook_ran": bool(hook_ran),
-                    "base_rank": base_rank,
-                    "steer_rank": steer_rank,
-                    "target_is_top1": target_is_top1,
-                })
+        # Stricter metrics: rank change of target token
+        tid = pc["target_id"]
+        base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
+        steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
+        target_is_top1 = bool(steer_rank == 1)
 
-        if (pi + 1) % 10 == 0:
-            print(f"done prompts {pi+1}/{len(dfp)}")
+        rows.append({
+            "prompt_idx": pi,
+            "feature_id": fid,
+            "alpha": alpha,
+            "seq_len": pc["seq_len"],
+            "target_id": int(tid),
+            "delta_logit_target": delta_target,
+            "tv_distance": tv,
+            "kl_base_to_steer": kl,
+            "topk_jaccard": jac,
+            "max_abs_dlogit": max_abs,
+            "hook_ran": bool(hook_ran),
+            "base_rank": base_rank,
+            "steer_rank": steer_rank,
+            "target_is_top1": target_is_top1,
+        })
+
+        # Heartbeat every 500 tasks
+        if (task_i + 1) % 500 == 0:
+            elapsed = time.time() - start_time
+            rate = (task_i + 1) / elapsed
+            remaining = (total_tasks - task_i - 1) / rate if rate > 0 else 0
+            print(f"[Heartbeat] {task_i+1}/{total_tasks}  "
+                  f"{rate:.1f} tasks/s  ETA {remaining/60:.1f}min")
+
+        # Periodic disk flush every 5 prompts worth of work
+        if pi != last_flush_pi and pi % 5 == 0:
+            last_flush_pi = pi
+            pd.DataFrame(rows).to_csv(partial_path, index=False)
 
     df = pd.DataFrame(rows)
 
