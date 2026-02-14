@@ -94,7 +94,11 @@ def main():
     device = next(model.parameters()).device
 
     hook_name = config["sae"]["hook_point"]
-    hook_module = resolve_hook_point(model, hook_name)
+    layer_idx = config["sae"]["layer_idx"]  # e.g. 20
+    # Hook directly on the HF decoder layer (not via resolve_hook_point — that was mapping
+    # a TL name but the hook return was not propagating through the model forward).
+    hook_module = model.model.layers[layer_idx]
+    print(f"Hooking directly: model.model.layers[{layer_idx}] ({type(hook_module).__name__})")
 
     # Load decoder + full NPZ for encoder/bias/threshold
     decoder_cpu, meta = load_gemmascope_decoder(config)
@@ -142,27 +146,44 @@ def main():
     ALPHAS = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, -1.0, -2.0, -5.0]
     pos = -1  # token position to steer (last token)
 
+    _hook_diag_printed = [False]
+
     def make_hook(alpha_val, capture):
-        def hook_fn(module, inp, outp):
+        def hook_fn(module, inputs, output):
             capture["ran"] = True
-            t = _get_main_tensor(outp)
 
-            # Capture pre-steering residual at target position
-            r_pre = t[0, pos].detach().clone()
-            capture["resid_pre"] = r_pre
+            # One-time diagnostic: print output structure
+            if not _hook_diag_printed[0]:
+                print(f"HOOK output type: {type(output)}")
+                if isinstance(output, tuple):
+                    print(f"HOOK output tuple len: {len(output)}, first elem type: {type(output[0])}, shape: {getattr(output[0], 'shape', None)}")
+                else:
+                    print(f"HOOK output shape: {getattr(output, 'shape', None)}")
+                _hook_diag_printed[0] = True
 
-            # Apply steering: clone to avoid in-place view issues
-            t2 = t.clone()
-            vec = W_dec[fid].to(dtype=t2.dtype)
-            t2[0, pos, :] = t2[0, pos, :] + alpha_val * vec
+            # Unwrap: HF decoder layers return tuple (hidden_states, ...) or plain tensor
+            if isinstance(output, tuple):
+                hidden = output[0]
+            else:
+                hidden = output
 
-            # Capture post-steering residual at target position
-            r_post = t2[0, pos].detach().clone()
-            capture["resid_post"] = r_post
+            hidden2 = hidden.clone()
 
-            if isinstance(outp, tuple):
-                return (t2,) + outp[1:]
-            return t2
+            # Capture pre-steering
+            capture["resid_pre"] = hidden2[0, pos].detach().clone()
+
+            # Apply steering
+            steer_dir = W_dec[fid].to(dtype=hidden2.dtype)
+            hidden2[0, pos, :] = hidden2[0, pos, :] + alpha_val * steer_dir
+
+            # Capture post-steering
+            capture["resid_post"] = hidden2[0, pos].detach().clone()
+
+            # Rewrap with exact same structure
+            if isinstance(output, tuple):
+                return (hidden2,) + output[1:]
+            else:
+                return hidden2
         return hook_fn
 
     def run_once(alpha_val):
