@@ -68,14 +68,30 @@ def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir:
         return layer.register_forward_pre_hook(_prehook)
     return _mk, ran
 
-def encode_target(tokenizer, target_text):
-    if target_text is None or (isinstance(target_text, float) and np.isnan(target_text)):
+def encode_target(tokenizer, t):
+    # handle NaN / None
+    if t is None:
         return None
-    t = target_text
+    try:
+        # pandas/numpy NaN
+        if isinstance(t, float) and np.isnan(t):
+            return None
+    except Exception:
+        pass
+
+    # force to string (fixes int targets)
+    t = str(t)
+
+    # empty string?
+    if t.strip() == "":
+        return None
+
+    # Gemma-like tokenizers often want a leading space for word-boundary tokens
     if not t.startswith(" "):
         t = " " + t
-    ids = tokenizer(t, add_special_tokens=False)["input_ids"]
-    return ids[0] if len(ids) > 0 else None
+
+    ids = tokenizer.encode(t, add_special_tokens=False)
+    return ids[0] if len(ids) == 1 else None
 
 def summarize_feature_directional(df_feat, tau: float):
     """
@@ -141,7 +157,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Load prompts
-    dfp = pd.read_csv(args.prompt_csv)
+    dfp = pd.read_csv(args.prompt_csv, dtype={"prompt": "string", "target": "string"})
     assert "prompt" in dfp.columns, "prompt_csv must have a 'prompt' column"
     if "target" not in dfp.columns:
         dfp["target"] = np.nan
