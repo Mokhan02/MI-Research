@@ -224,27 +224,44 @@ def main():
     fid = int(top_idx[0].item())
     print(f"\nUsing feature_id={fid} (most active) for steering next.\n")
 
-    # ---- Manual vs model logit diagnostic ----
-    print("=== Manual vs model logit diagnostic (alpha=5.0) ===")
-    r_base = run_once(0.0)
-    r_steer = run_once(5.0)
-    print("DEBUG r_steer keys:", list(r_steer.keys()))
-    print("DEBUG r_steer repr:", r_steer)
-    resid_pre = r_base["resid_pre"]
-    resid_post = r_steer["resid_post"]
+    # ---- Manual vs model logit diagnostic (two separate runs) ----
+    print("=== Manual vs model logit diagnostic (alpha=0 vs alpha=5.0) ===")
+    base = run_once(0.0)
+    steer = run_once(5.0)
+
+    # Manual prediction from captured residuals
+    resid_pre = base["resid_pre"]
+    resid_post = steer["resid_post"]
     manual_base = torch.dot(resid_pre, lm_head_w[tid]).item()
     manual_steer = torch.dot(resid_post, lm_head_w[tid]).item()
     manual_dlogit = manual_steer - manual_base
     print(f"MANUAL base/steer/delta: {manual_base:.4f} {manual_steer:.4f} {manual_dlogit:+.4f}")
-    print(f"MODEL  logit[-1, tid]:   base={r_base['logits'][tid].item():.4f}  steer={r_steer['logits'][tid].item():.4f}  Δ={r_steer['logits'][tid].item() - r_base['logits'][tid].item():+.4f}")
 
-    # Brute-force correct position
-    T = r_steer["full_logits"].shape[1]
+    # Model logits from two separate runs
+    base_last = base["full_logits"][0, -1, tid].item()
+    steer_last = steer["full_logits"][0, -1, tid].item()
+    print(f"MODEL logit[-1, tid]: base={base_last:.4f} steer={steer_last:.4f} Δ={steer_last - base_last:+.4f}")
+
+    # Check if ANYTHING changed in logits at last position
+    delta_logits_last = (steer["full_logits"][0, -1, :] - base["full_logits"][0, -1, :]).abs()
+    print(f"max |Δlogit| at last position (across vocab): {delta_logits_last.max().item():.6f}")
+
+    # Brute-force scan: every position
+    T = base["full_logits"].shape[1]
     print(f"\nBrute-force position scan (seq_len={T}):")
-    for p in range(max(0, T - 4), T):
-        base_l = r_base["full_logits"][0, p, tid].item()
-        steer_l = r_steer["full_logits"][0, p, tid].item()
-        print(f"  pos={p}  base={base_l:.4f}  steer={steer_l:.4f}  Δ={steer_l - base_l:+.4f}")
+    for p in range(T):
+        b = base["full_logits"][0, p, tid].item()
+        s = steer["full_logits"][0, p, tid].item()
+        d = s - b
+        marker = " ***" if abs(d) > 0.001 else ""
+        print(f"  pos={p}  base={b:.4f}  steer={s:.4f}  Δ={d:+.4f}{marker}")
+
+    # Max |Δlogit| per position (across all vocab tokens)
+    print("\nMax |Δlogit| per position (across vocab):")
+    for p in range(T):
+        delta_p = (steer["full_logits"][0, p, :] - base["full_logits"][0, p, :]).abs().max().item()
+        marker = " ***" if delta_p > 0.001 else ""
+        print(f"  pos={p}  max|Δlogit|={delta_p:.6f}{marker}")
     print()
 
     # ---- Run alpha grid, capture resid, compute z/act/logit/projection ----
