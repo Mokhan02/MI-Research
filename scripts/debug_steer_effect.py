@@ -144,7 +144,9 @@ def main():
 
     def make_hook(alpha_val, capture):
         def hook_fn(module, inp, outp):
+            capture["ran"] = True
             t = _get_main_tensor(outp)
+
             # Capture pre-steering residual at target position
             r_pre = t[0, pos].detach().clone()
             capture["resid_pre"] = r_pre
@@ -164,22 +166,24 @@ def main():
         return hook_fn
 
     def run_once(alpha_val):
-        """Single forward pass with steering. Returns dict with logits, tokens, capture, full_logits."""
-        capture = {}
+        """Single forward pass with steering. Returns dict with logits, tokens, resid_pre, resid_post, full_logits."""
+        capture = {"ran": False, "resid_pre": None, "resid_post": None}
         handle = hook_module.register_forward_hook(make_hook(alpha_val, capture))
         with torch.no_grad():
             out = model(**inputs)
             full_logits = out.logits.float()       # [1, seq, vocab]
             logits = full_logits[0, -1]             # last position
         handle.remove()
-        if "resid_post" not in capture:
-            raise RuntimeError("Hook did not capture residual")
+        if not capture["ran"]:
+            raise RuntimeError("Hook never ran. You're not actually attached to the right hook point/module.")
+        if capture["resid_post"] is None:
+            raise RuntimeError("Hook ran but resid_post is None. Indexing/pos logic is wrong.")
         resid_pre = capture["resid_pre"].float()
         resid_post = capture["resid_post"].float()
         tokens = logits.argmax(dim=-1, keepdim=True)
         return {"logits": logits, "tokens": tokens,
                 "resid_last": resid_post, "resid_pre": resid_pre,
-                "full_logits": full_logits, "capture": capture}
+                "full_logits": full_logits, "hook_ran": capture["ran"]}
 
     print()
     print("PROMPT:", repr(prompt))
