@@ -262,6 +262,8 @@ def main():
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--alphas", type=str, default="-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40",
                         help="Comma-separated alpha values, e.g. -40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
+    ap.add_argument("--feature_ids_file", type=str, default=None,
+                        help="Path to txt with one feature_id per line. If set, overrides random sampling.")
     args = ap.parse_args()
 
     set_determinism(args.seed)
@@ -291,8 +293,14 @@ def main():
 
     # Choose features
     n_feats_total = W_dec.shape[0]
-    rng = np.random.default_rng(args.seed)
-    feature_ids = rng.choice(n_feats_total, size=min(args.n_features, n_feats_total), replace=False).tolist()
+    if args.feature_ids_file:
+        with open(args.feature_ids_file) as f:
+            feature_ids = [int(x.strip()) for x in f if x.strip()]
+        feature_ids = feature_ids[:args.n_features]
+        print(f"Loaded {len(feature_ids)} feature IDs from {args.feature_ids_file}")
+    else:
+        rng = np.random.default_rng(args.seed)
+        feature_ids = rng.choice(n_feats_total, size=min(args.n_features, n_feats_total), replace=False).tolist()
 
     alphas = [float(x) for x in args.alphas.split(",")]
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
