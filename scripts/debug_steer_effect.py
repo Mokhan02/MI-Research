@@ -183,6 +183,7 @@ def main():
         tokens = logits.argmax(dim=-1, keepdim=True)
         return {"logits": logits, "tokens": tokens,
                 "resid_last": resid_post, "resid_pre": resid_pre,
+                "resid_post": resid_post,
                 "full_logits": full_logits, "hook_ran": capture["ran"]}
 
     print()
