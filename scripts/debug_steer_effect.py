@@ -107,10 +107,14 @@ def main():
     b_enc = torch.tensor(np.asarray(data["b_enc"], dtype=np.float32), device=device, dtype=torch.float32)
     thr   = torch.tensor(np.asarray(data["threshold"], dtype=np.float32), device=device, dtype=torch.float32)
 
+    # Unembedding weight for predicted Δlogit
+    lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
+
     print(f"W_dec shape: {W_dec.shape}")  # expect (n_features, d_model)
     print(f"W_enc shape: {W_enc.shape}")  # could be (d_model, n_features) or (n_features, d_model)
     print(f"b_enc shape: {b_enc.shape}")
     print(f"thr   shape: {thr.shape}")
+    print(f"lm_head_w shape: {lm_head_w.shape}")  # [vocab, d_model]
 
     d_model = W_dec.shape[1]
 
@@ -203,8 +207,10 @@ def main():
     base_logit = next(lt for a, _, _, lt, _ in results if a == 0.0)
     norm2_wdec = torch.dot(W_dec[fid], W_dec[fid]).item()
 
-    print(f"{'alpha':>6}  {'z_f':>12}  {'thr':>10}  {'act(fid)':>10}  {'logit':>10}  {'Δlogit':>10}  {'proj(Δr,Wdec)':>14}  {'expected':>14}")
-    print("-" * 100)
+    wu_k = lm_head_w[tid]  # [d_model] unembedding for target token
+
+    print(f"{'alpha':>6}  {'z_f':>12}  {'thr':>10}  {'act(fid)':>10}  {'logit':>10}  {'Δlogit':>10}  {'predΔl':>10}  {'proj(Δr,Wdec)':>14}  {'expected':>14}  {'maxΔl':>10}")
+    print("-" * 120)
     for alpha, z_val, act_val, logit_val, resid_last in results:
         delta_logit = logit_val - base_logit
         # Projection of residual delta onto W_dec[fid]
@@ -212,12 +218,17 @@ def main():
             delta_r = resid_last - base_resid_last
             proj = torch.dot(delta_r, W_dec[fid]).item()
             expected = alpha * norm2_wdec
+            pred_dlogit = torch.dot(delta_r, wu_k).item()
+            pred_all = lm_head_w @ delta_r  # [vocab]
+            pred_max = pred_all.abs().max().item()
         else:
             proj = 0.0
             expected = 0.0
+            pred_dlogit = 0.0
+            pred_max = 0.0
         print(f"alpha={alpha:+5.1f}  z={z_val:+12.6f}  thr={thr[fid].item():+10.6f}  act={act_val:10.6f}  "
-              f"logit={logit_val:+10.4f}  Δlogit={delta_logit:+10.4f}  "
-              f"proj={proj:+14.6f}  expected~{expected:+14.6f}")
+              f"logit={logit_val:+10.4f}  Δlogit={delta_logit:+10.4f}  predΔl={pred_dlogit:+10.4f}  "
+              f"proj={proj:+14.6f}  expected~{expected:+14.6f}  maxΔl={pred_max:10.4f}")
 
     # ---- Top-10 next tokens at alpha=0 and alpha=+5 ----
     def show_top(logits, title):
