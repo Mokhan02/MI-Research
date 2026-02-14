@@ -48,6 +48,7 @@ def next_token_metrics(logits_base: torch.Tensor, logits_steer: torch.Tensor, ep
     max_abs = d_abs.max().item()
     mean_abs = d_abs.mean().item()
     p95_abs = torch.quantile(d_abs.float(), 0.95).item()
+    l2 = d.float().norm().item()
 
     # Probability distributions
     p = F.softmax(logits_base, dim=-1)
@@ -69,6 +70,7 @@ def next_token_metrics(logits_base: torch.Tensor, logits_steer: torch.Tensor, ep
         "max_abs_dlogit": max_abs,
         "mean_abs_dlogit": mean_abs,
         "p95_abs_dlogit": p95_abs,
+        "l2_dlogit": l2,
         "kl_base_to_steer": kl,
         "tv_distance": tv,
         "topk_overlap": topk_inter,
@@ -191,7 +193,7 @@ def main():
             for alpha in ALPHAS:
                 if alpha == 0.0:
                     m = {k: 0.0 for k in ["max_abs_dlogit", "mean_abs_dlogit", "p95_abs_dlogit",
-                                           "kl_base_to_steer", "tv_distance"]}
+                                           "l2_dlogit", "kl_base_to_steer", "tv_distance"]}
                     m["topk_overlap"] = 50
                     m["topk_jaccard"] = 1.0
                 else:
