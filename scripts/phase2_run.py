@@ -77,6 +77,49 @@ def encode_target(tokenizer, target_text):
     ids = tokenizer(t, add_special_tokens=False)["input_ids"]
     return ids[0] if len(ids) > 0 else None
 
+def summarize_feature_directional(df_feat, tau: float):
+    """
+    df_feat: run_rows filtered to a single feature_id (all prompts, all alphas)
+    Returns dict with directional success rates and alpha* means (positive alphas only).
+    """
+    # Only positive alphas for alpha* definition
+    pos = df_feat[df_feat["alpha"] > 0].copy()
+
+    # If no positive alphas exist, bail
+    if len(pos) == 0:
+        return dict(
+            success_rate_up=0.0,
+            success_rate_down=0.0,
+            alpha_star_mean_up=np.nan,
+            alpha_star_mean_down=np.nan,
+        )
+
+    # Per (prompt) maxima/minima over positive alphas
+    g = pos.groupby("prompt_idx")["delta_logit_target"]
+    mx = g.max()  # best upward push achievable
+    mn = g.min()  # best downward push achievable
+
+    succ_up = (mx >= tau)
+    succ_down = (mn <= -tau)
+
+    # alpha* per prompt: smallest alpha that hits the threshold
+    hit_up_rows = pos[pos["delta_logit_target"] >= tau]
+    hit_down_rows = pos[pos["delta_logit_target"] <= -tau]
+
+    alpha_star_up = hit_up_rows.groupby("prompt_idx")["alpha"].min()
+    alpha_star_down = hit_down_rows.groupby("prompt_idx")["alpha"].min()
+
+    # Means over prompts where success occurred
+    alpha_star_mean_up = alpha_star_up.mean() if len(alpha_star_up) > 0 else np.nan
+    alpha_star_mean_down = alpha_star_down.mean() if len(alpha_star_down) > 0 else np.nan
+
+    return dict(
+        success_rate_up=float(succ_up.mean()),
+        success_rate_down=float(succ_down.mean()),
+        alpha_star_mean_up=float(alpha_star_mean_up) if not np.isnan(alpha_star_mean_up) else np.nan,
+        alpha_star_mean_down=float(alpha_star_mean_down) if not np.isnan(alpha_star_mean_down) else np.nan,
+    )
+
 # --------------------------
 # Main
 # --------------------------
@@ -128,7 +171,6 @@ def main():
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
 
     rows = []
-    alpha_star_rows = []
 
     for pi, prow in dfp.iterrows():
         prompt = prow["prompt"]
@@ -143,8 +185,6 @@ def main():
 
         for fid in feature_ids:
             steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
-            alpha_star_up = None    # min |alpha| where delta >= +tau
-            alpha_star_down = None  # min |alpha| where delta <= -tau
 
             for alpha in alphas_sorted:
                 if alpha == 0.0:
@@ -176,75 +216,37 @@ def main():
                     "hook_ran": bool(hook_ran),
                 })
 
-                # Only positive alphas count for alpha_star
-                if alpha > 0.0:
-                    if alpha_star_up is None and delta_target >= args.tau:
-                        alpha_star_up = alpha
-                    if alpha_star_down is None and delta_target <= -args.tau:
-                        alpha_star_down = alpha
-
-            alpha_star_rows.append({
-                "prompt_idx": pi,
-                "feature_id": fid,
-                "alpha_star_up": alpha_star_up if alpha_star_up is not None else np.nan,
-                "alpha_star_down": alpha_star_down if alpha_star_down is not None else np.nan,
-            })
-
         if (pi + 1) % 10 == 0:
             print(f"done prompts {pi+1}/{len(dfp)}")
 
     df = pd.DataFrame(rows)
-    df_alpha = pd.DataFrame(alpha_star_rows)
 
     # Write raw rows
     run_path = os.path.join(args.out_dir, "run_rows.csv")
     df.to_csv(run_path, index=False)
 
     # -----------------------------------------------------------
-    # Aggregate per feature (directional, positive-alpha only)
+    # Aggregate per feature via summarize_feature_directional
     # -----------------------------------------------------------
-    # Step 1: per (prompt, feature) stats from positive alphas
-    df_pos = df[df.alpha > 0].copy()
-    pf = (df_pos.groupby(["prompt_idx", "feature_id"])
-          .agg(mx=("delta_logit_target", "max"),
-               mn=("delta_logit_target", "min"))
-          .reset_index())
-    pf["succ_up"] = pf["mx"] >= args.tau
-    pf["succ_down"] = pf["mn"] <= -args.tau
+    summary_rows = []
+    for fid, df_feat in df.groupby("feature_id"):
+        d = summarize_feature_directional(df_feat, tau=args.tau)
 
-    # Merge in alpha_star from the per-(prompt,feature) tracking
-    pf = pf.merge(df_alpha, on=["prompt_idx", "feature_id"], how="left")
+        row = {
+            "feature_id": fid,
+            # Off-target metrics (all alphas)
+            "tv_mean": df_feat["tv_distance"].mean() if "tv_distance" in df_feat.columns else np.nan,
+            "kl_mean": df_feat["kl_base_to_steer"].mean() if "kl_base_to_steer" in df_feat.columns else np.nan,
+            "maxabs_mean": df_feat["max_abs_dlogit"].mean() if "max_abs_dlogit" in df_feat.columns else np.nan,
+            "jacc_mean": df_feat["topk_jaccard"].mean() if "topk_jaccard" in df_feat.columns else np.nan,
+            "target_delta_mean": df_feat["delta_logit_target"].mean(),
+            # Directional success/alpha*
+            **d,
+        }
+        summary_rows.append(row)
 
-    # Step 2: aggregate per feature
-    def _agg_feat(g):
-        su = g["succ_up"].mean()
-        sd = g["succ_down"].mean()
-        # alpha_star_mean only over prompts where success occurred
-        up_vals = g.loc[g["succ_up"], "alpha_star_up"]
-        dn_vals = g.loc[g["succ_down"], "alpha_star_down"]
-        amu = up_vals.mean() if len(up_vals) > 0 else np.nan
-        amd = dn_vals.mean() if len(dn_vals) > 0 else np.nan
-        return pd.Series({
-            "success_rate_up": su,
-            "success_rate_down": sd,
-            "alpha_star_mean_up": amu,
-            "alpha_star_mean_down": amd,
-        })
-
-    feat_alpha = pf.groupby("feature_id").apply(_agg_feat).reset_index()
-
-    # Step 3: off-target summary at reference alpha
+    feat_summary = pd.DataFrame(summary_rows)
     alpha_ref = max(alphas, key=lambda a: abs(a))
-    df_ref = df[df.alpha == alpha_ref].copy()
-    feat_ref = (df_ref.groupby("feature_id")
-                .agg(tv_mean=("tv_distance", "mean"),
-                     kl_mean=("kl_base_to_steer", "mean"),
-                     maxabs_mean=("max_abs_dlogit", "mean"),
-                     jacc_mean=("topk_jaccard", "mean"),
-                     target_delta_mean=("delta_logit_target", "mean"))
-                .reset_index())
-
-    feat_summary = feat_alpha.merge(feat_ref, on="feature_id", how="left")
     summary_path = os.path.join(args.out_dir, "feature_summary.csv")
     feat_summary.to_csv(summary_path, index=False)
 
