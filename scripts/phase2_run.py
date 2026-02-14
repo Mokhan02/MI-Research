@@ -150,7 +150,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--tau", type=float, default=0.5)
     ap.add_argument("--topk", type=int, default=50)
-    ap.add_argument("--alphas", type=str, default="-5,-2,-1,0,1,2,5")
+    ap.add_argument("--alphas", type=str, default="0,1,2,5,10,20,40")
     args = ap.parse_args()
 
     set_determinism(args.seed)
