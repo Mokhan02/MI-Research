@@ -146,26 +146,20 @@ def main():
     ALPHAS = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, -1.0, -2.0, -5.0]
     pos = -1  # token position to steer (last token)
 
-    _hook_diag_printed = [False]
+    _prehook_diag_printed = [False]
 
-    def make_hook(alpha_val, capture):
-        def hook_fn(module, inputs, output):
+    def make_steer_prehook(alpha_val, capture):
+        def _prehook(module, inputs):
             capture["ran"] = True
 
-            # One-time diagnostic: print output structure
-            if not _hook_diag_printed[0]:
-                print(f"HOOK output type: {type(output)}")
-                if isinstance(output, tuple):
-                    print(f"HOOK output tuple len: {len(output)}, first elem type: {type(output[0])}, shape: {getattr(output[0], 'shape', None)}")
-                else:
-                    print(f"HOOK output shape: {getattr(output, 'shape', None)}")
-                _hook_diag_printed[0] = True
+            # inputs is a tuple; first element is hidden_states
+            hidden = inputs[0]
 
-            # Unwrap: HF decoder layers return tuple (hidden_states, ...) or plain tensor
-            if isinstance(output, tuple):
-                hidden = output[0]
-            else:
-                hidden = output
+            # One-time diagnostic
+            if not _prehook_diag_printed[0]:
+                print(f"PREHOOK inputs[0] shape: {hidden.shape}")
+                print(f"PREHOOK inputs tuple len: {len(inputs)}")
+                _prehook_diag_printed[0] = True
 
             hidden2 = hidden.clone()
 
@@ -179,17 +173,14 @@ def main():
             # Capture post-steering
             capture["resid_post"] = hidden2[0, pos].detach().clone()
 
-            # Rewrap with exact same structure
-            if isinstance(output, tuple):
-                return (hidden2,) + output[1:]
-            else:
-                return hidden2
-        return hook_fn
+            # Return new inputs tuple with hidden replaced
+            return (hidden2,) + inputs[1:]
+        return _prehook
 
     def run_once(alpha_val):
-        """Single forward pass with steering. Returns dict with logits, tokens, resid_pre, resid_post, full_logits."""
+        """Single forward pass with steering via pre-hook. Returns dict with logits, tokens, resid_pre, resid_post, full_logits."""
         capture = {"ran": False, "resid_pre": None, "resid_post": None}
-        handle = hook_module.register_forward_hook(make_hook(alpha_val, capture))
+        handle = hook_module.register_forward_pre_hook(make_steer_prehook(alpha_val, capture))
         with torch.no_grad():
             out = model(**inputs)
             full_logits = out.logits.float()       # [1, seq, vocab]
