@@ -140,42 +140,46 @@ def main():
     tid = target_ids[0]
 
     ALPHAS = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, -1.0, -2.0, -5.0]
-    captured_resid = []
+    pos = -1  # token position to steer (last token)
 
-    captured_resid_pre = []  # pre-steering residual
-    captured_resid_post = [] # post-steering residual
-
-    def make_hook(alpha_val):
+    def make_hook(alpha_val, capture):
         def hook_fn(module, inp, outp):
             t = _get_main_tensor(outp)
-            captured_resid_pre.append(t.detach())
-            vec = W_dec[fid].to(dtype=t.dtype)
+            # Capture pre-steering residual at target position
+            r_pre = t[0, pos].detach().clone()
+            capture["resid_pre"] = r_pre
+
+            # Apply steering: clone to avoid in-place view issues
             t2 = t.clone()
-            t2[:, -1, :] = t2[:, -1, :] + alpha_val * vec
-            captured_resid_post.append(t2.detach())
+            vec = W_dec[fid].to(dtype=t2.dtype)
+            t2[0, pos, :] = t2[0, pos, :] + alpha_val * vec
+
+            # Capture post-steering residual at target position
+            r_post = t2[0, pos].detach().clone()
+            capture["resid_post"] = r_post
+
             if isinstance(outp, tuple):
                 return (t2,) + outp[1:]
             return t2
         return hook_fn
 
     def run_once(alpha_val):
-        """Single forward pass with steering. Returns dict with logits, tokens, resid_pre, resid_post, full_logits."""
-        captured_resid_pre.clear()
-        captured_resid_post.clear()
-        handle = hook_module.register_forward_hook(make_hook(alpha_val))
+        """Single forward pass with steering. Returns dict with logits, tokens, capture, full_logits."""
+        capture = {}
+        handle = hook_module.register_forward_hook(make_hook(alpha_val, capture))
         with torch.no_grad():
             out = model(**inputs)
             full_logits = out.logits.float()       # [1, seq, vocab]
             logits = full_logits[0, -1]             # last position
         handle.remove()
-        if not captured_resid_post:
+        if "resid_post" not in capture:
             raise RuntimeError("Hook did not capture residual")
-        resid_pre = captured_resid_pre[0][0, -1, :].float()
-        resid_post = captured_resid_post[0][0, -1, :].float()
+        resid_pre = capture["resid_pre"].float()
+        resid_post = capture["resid_post"].float()
         tokens = logits.argmax(dim=-1, keepdim=True)
         return {"logits": logits, "tokens": tokens,
                 "resid_last": resid_post, "resid_pre": resid_pre,
-                "full_logits": full_logits}
+                "full_logits": full_logits, "capture": capture}
 
     print()
     print("PROMPT:", repr(prompt))
