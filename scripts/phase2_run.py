@@ -264,6 +264,9 @@ def main():
                         help="Comma-separated alpha values, e.g. -40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
     ap.add_argument("--feature_ids_file", type=str, default=None,
                         help="Path to txt with one feature_id per line. If set, overrides random sampling.")
+    ap.add_argument("--heartbeat_every", type=int, default=500)
+    ap.add_argument("--flush_every", type=int, default=2000)
+    ap.add_argument("--resume", action="store_true", help="Skip tasks already in run_rows.csv")
     args = ap.parse_args()
 
     set_determinism(args.seed)
@@ -308,8 +311,6 @@ def main():
     # lm_head weight for fp32 target logit computation
     lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
 
-    rows = []
-
     # Pre-compute per-prompt baselines (one forward pass each)
     print(f"Computing baselines for {len(dfp)} prompts...")
     prompt_cache = {}
@@ -331,13 +332,24 @@ def main():
     # Flat iterator over all (prompt, feature, alpha) jobs
     all_jobs = list(product(dfp.index, feature_ids, alphas_sorted))
     total_tasks = len(all_jobs)
+    run_csv = Path(args.out_dir) / "run_rows.csv"
     start_time = time.time()
-    last_flush_pi = -1
-    partial_path = os.path.join(args.out_dir, "run_rows_partial.csv")
+    buffer = []
+
+    # Resume: skip tasks already in run_rows.csv
+    done = set()
+    if args.resume and run_csv.exists():
+        prev = pd.read_csv(run_csv, usecols=["prompt_idx", "feature_id", "alpha"])
+        done = set(map(tuple, prev.values))
+        print(f"[Resume] loaded {len(done)} completed tasks from {run_csv}")
 
     print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
 
+    completed_this_session = 0
     for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering")):
+        if (pi, fid, alpha) in done:
+            continue
+
         pc = prompt_cache[pi]
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
 
@@ -371,7 +383,7 @@ def main():
         steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
         target_is_top1 = bool(steer_rank == 1)
 
-        rows.append({
+        row = {
             "prompt_idx": pi,
             "feature_id": fid,
             "alpha": alpha,
@@ -386,26 +398,34 @@ def main():
             "base_rank": base_rank,
             "steer_rank": steer_rank,
             "target_is_top1": target_is_top1,
-        })
+        }
+        buffer.append(row)
+        completed_this_session += 1
 
-        # Heartbeat every 500 tasks
-        if (task_i + 1) % 500 == 0:
+        # Flush buffer to disk
+        if len(buffer) >= args.flush_every:
+            df_out = pd.DataFrame(buffer)
+            header = not run_csv.exists()
+            df_out.to_csv(run_csv, mode="a", header=header, index=False)
+            buffer.clear()
+            print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
+
+        # Heartbeat
+        done_tasks = len(done) + completed_this_session
+        if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
             elapsed = time.time() - start_time
-            rate = (task_i + 1) / elapsed
-            remaining = (total_tasks - task_i - 1) / rate if rate > 0 else 0
-            print(f"[Heartbeat] {task_i+1}/{total_tasks}  "
-                  f"{rate:.1f} tasks/s  ETA {remaining/60:.1f}min")
+            rate = completed_this_session / max(1e-9, elapsed)
+            eta = (total_tasks - done_tasks) / max(1e-9, rate)
+            print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
 
-        # Periodic disk flush every 5 prompts worth of work
-        if pi != last_flush_pi and pi % 5 == 0:
-            last_flush_pi = pi
-            pd.DataFrame(rows).to_csv(partial_path, index=False)
+    # Flush remaining buffer
+    if buffer:
+        df_out = pd.DataFrame(buffer)
+        header = not run_csv.exists()
+        df_out.to_csv(run_csv, mode="a", header=header, index=False)
+        print(f"[Flush] wrote {len(buffer)} rows -> {run_csv}")
 
-    df = pd.DataFrame(rows)
-
-    # Write raw rows
-    run_path = os.path.join(args.out_dir, "run_rows.csv")
-    df.to_csv(run_path, index=False)
+    df = pd.read_csv(run_csv)
 
     # -----------------------------------------------------------
     # Aggregate per feature via summarize_feature_directional
@@ -460,7 +480,7 @@ def main():
     with open(os.path.join(args.out_dir, "meta.json"), "w") as f:
         json.dump(meta_out, f, indent=2)
 
-    print(f"\nWrote:\n- {run_path}\n- {summary_path}\n- {os.path.join(args.out_dir, 'meta.json')}")
+    print(f"\nWrote:\n- {run_csv}\n- {summary_path}\n- {os.path.join(args.out_dir, 'meta.json')}")
     print(feat_summary.sort_values(["alpha_star_mean_up", "tv_mean"], ascending=[True, True]).head(15))
 
 
