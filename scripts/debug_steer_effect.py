@@ -29,6 +29,34 @@ def _get_main_tensor(outp):
     return outp[0] if isinstance(outp, tuple) else outp
 
 
+def sae_z_and_act(resid_vec: torch.Tensor, W_enc: torch.Tensor, b_enc: torch.Tensor, thr: torch.Tensor):
+    """
+    resid_vec: [d_model] at a specific token position
+    W_enc: [d_model, n_feats]
+    b_enc, thr: [n_feats]
+    Returns z: [n_feats], act: [n_feats] where act = relu(z - thr)
+    """
+    resid_vec = resid_vec.view(-1)
+    z = resid_vec @ W_enc + b_enc
+    act = torch.relu(z - thr)
+    return z, act
+
+
+def print_top_active_features(resid_vec, W_enc, b_enc, thr, topk=10):
+    z, act = sae_z_and_act(resid_vec, W_enc, b_enc, thr)
+    vals, idx = torch.topk(act, k=topk)
+    print("\nTOP ACTIVE SAE FEATURES (by act = relu(z - thr))")
+    print(" fid        act        z        thr     (z-thr)")
+    print("------------------------------------------------")
+    for v, i in zip(vals.tolist(), idx.tolist()):
+        zi = z[i].item()
+        thi = thr[i].item()
+        print(f"{i:5d}  {v:9.6f}  {zi:8.4f}  {thi:8.4f}  {zi-thi:9.4f}")
+    num_active = (act > 0).sum().item()
+    print(f"\nActive features count: {num_active} / {act.numel()}")
+    return idx, z, act
+
+
 def run_once_generate(model, tokenizer, prompt, max_new_tokens=20):
     """Run model.generate (greedy, deterministic) and return tokens + per-step scores."""
     device = next(model.parameters()).device
@@ -152,15 +180,22 @@ def main():
     print("PASS: logits and tokens are bitwise identical across two runs.")
     print()
 
+    # ---- Baseline pass (alpha=0): find top active features ----
+    r0 = run_once(0.0)
+    base_resid_last = r0["resid_last"]
+    print("=== Top active SAE features at baseline (alpha=0) ===")
+    top_idx, _, _ = print_top_active_features(
+        base_resid_last, W_enc, b_enc, thr, topk=20
+    )
+    fid = int(top_idx[0].item())
+    print(f"\nUsing feature_id={fid} (most active) for steering next.\n")
+
     # ---- Run alpha grid, capture resid, compute z/act/logit/projection ----
     results = []
-    base_resid_last = None
     for alpha in ALPHAS:
         r = run_once(alpha)
         logits = r["logits"]
         resid_last = r["resid_last"]
-        if alpha == 0.0:
-            base_resid_last = resid_last.clone()
         z, act = z_and_act(resid_last, fid)
         logit_target = logits[tid].item()
         results.append((alpha, z.item(), act.item(), logit_target, resid_last))
