@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_CSV = "outputs/phase3_predictability_arith/arithmetic_features_merged.csv"
-FEATURES = ["max_cosine_to_any", "density_tau", "mean_topk_cos", "act_freq", "mean_z_minus_thr"]
+FEATURES = ["max_cosine_to_any", "density_tau", "mean_topk_cos", "act_freq"]
 
 
 def zscore(X):
