@@ -36,15 +36,44 @@ N_PROMPTS = 20
 LAYER_IDX = 20
 
 
-def next_token_metrics(logits_base: torch.Tensor, logits_steer: torch.Tensor, eps: float = EPS):
-    """Compute distributional deltas between base and steered next-token logits ([vocab] each)."""
+def next_token_metrics(logits_base: torch.Tensor, logits_steer: torch.Tensor, eps: float = EPS, topk: int = 50):
+    """
+    Compute distributional deltas between base and steered next-token logits ([vocab] each).
+    Returns dict with all metrics.
+    """
     d = logits_steer - logits_base
-    max_abs = d.abs().max().item()
-    breadth = (d.abs() > eps).sum().item()
+    d_abs = d.abs()
+
+    # Logit-level stats
+    max_abs = d_abs.max().item()
+    mean_abs = d_abs.mean().item()
+    p95_abs = torch.quantile(d_abs.float(), 0.95).item()
+
+    # Probability distributions
     p = F.softmax(logits_base, dim=-1)
     q = F.softmax(logits_steer, dim=-1)
+
+    # KL(p||q)
     kl = (p * (torch.log(p + 1e-12) - torch.log(q + 1e-12))).sum().item()
-    return max_abs, kl, breadth
+
+    # Total Variation distance: 0.5 * sum|p - q|
+    tv = 0.5 * (p - q).abs().sum().item()
+
+    # Top-k overlap (Jaccard on top-50 tokens)
+    topk_base = set(torch.topk(logits_base, k=topk).indices.tolist())
+    topk_steer = set(torch.topk(logits_steer, k=topk).indices.tolist())
+    topk_inter = len(topk_base & topk_steer)
+    topk_jaccard = topk_inter / len(topk_base | topk_steer) if (topk_base | topk_steer) else 1.0
+
+    return {
+        "max_abs_dlogit": max_abs,
+        "mean_abs_dlogit": mean_abs,
+        "p95_abs_dlogit": p95_abs,
+        "kl_base_to_steer": kl,
+        "tv_distance": tv,
+        "topk_overlap": topk_inter,
+        "topk_jaccard": topk_jaccard,
+    }
 
 
 @torch.no_grad()
@@ -161,22 +190,24 @@ def main():
 
             for alpha in ALPHAS:
                 if alpha == 0.0:
-                    max_abs, kl, breadth = 0.0, 0.0, 0
+                    m = {k: 0.0 for k in ["max_abs_dlogit", "mean_abs_dlogit", "p95_abs_dlogit",
+                                           "kl_base_to_steer", "tv_distance"]}
+                    m["topk_overlap"] = 50
+                    m["topk_jaccard"] = 1.0
                 else:
                     mk_hook, cap = make_steer_prehook(model, alpha, pos, steer_dir)
                     steer_logits, _ = forward_last_logits(model, tokenizer, prompt, prehook_fn=mk_hook)
                     assert cap["ran"], f"Prehook never ran for fid={fid} alpha={alpha}"
-                    max_abs, kl, breadth = next_token_metrics(base_logits, steer_logits)
+                    m = next_token_metrics(base_logits, steer_logits)
 
-                rows.append({
+                row = {
                     "prompt_idx": pi,
                     "feature_id": fid,
                     "alpha": alpha,
-                    "max_abs_dlogit": round(max_abs, 6),
-                    "kl_base_to_steer": round(kl, 6),
-                    "breadth_eps": breadth,
                     "seq_len": int(seq_len),
-                })
+                }
+                row.update({k: round(v, 6) if isinstance(v, float) else v for k, v in m.items()})
+                rows.append(row)
                 done += 1
                 if done % 50 == 0:
                     print(f"  progress {done}/{total}")
