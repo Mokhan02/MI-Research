@@ -240,6 +240,14 @@ def summarize_feature_directional(df_feat, tau: float):
 # Main
 # --------------------------
 def main():
+    # Preprocess sys.argv: merge --alphas <value> into --alphas=<value>
+    # so argparse doesn't choke on values starting with '-'
+    for i in range(len(sys.argv) - 1):
+        if sys.argv[i] == "--alphas":
+            sys.argv[i] = "--alphas=" + sys.argv[i + 1]
+            del sys.argv[i + 1]
+            break
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
     ap.add_argument("--prompt_csv", type=str, default="data/phase2_prompts.csv")
@@ -251,8 +259,7 @@ def main():
     ap.add_argument("--tau", type=float, default=0.5)
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--alphas", type=str, default="-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40",
-                        help="Comma-separated alpha values. Use = to pass negatives, "
-                             "e.g. --alphas=-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
+                        help="Comma-separated alpha values, e.g. -40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
     args = ap.parse_args()
 
     set_determinism(args.seed)
