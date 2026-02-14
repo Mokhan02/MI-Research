@@ -215,6 +215,8 @@ def main():
     print("=== Manual vs model logit diagnostic (alpha=5.0) ===")
     r_base = run_once(0.0)
     r_steer = run_once(5.0)
+    print("DEBUG r_steer keys:", list(r_steer.keys()))
+    print("DEBUG r_steer repr:", r_steer)
     resid_pre = r_base["resid_pre"]
     resid_post = r_steer["resid_post"]
     manual_base = torch.dot(resid_pre, lm_head_w[tid]).item()
