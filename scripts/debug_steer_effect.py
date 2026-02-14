@@ -27,6 +27,29 @@ def _get_main_tensor(outp):
     return outp[0] if isinstance(outp, tuple) else outp
 
 
+def run_once_generate(model, tokenizer, prompt, max_new_tokens=20):
+    """Run model.generate (greedy, deterministic) and return tokens + per-step scores."""
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            top_p=1.0,
+            num_beams=1,
+            return_dict_in_generate=True,
+            output_scores=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+    # out.sequences: (1, prompt_len + generated_len)
+    # out.scores: tuple of (1, vocab_size) per generated step
+    tokens = out.sequences[0]  # (seq_len,)
+    scores = torch.stack(out.scores, dim=0)  # (n_steps, vocab_size)
+    return {"tokens": tokens, "scores": scores}
+
+
 def main():
     cfg_path = "configs/targets/gemma2_2b_gemmascope_res16k.yaml"
     run_id = "debug_steer_effect"
@@ -170,6 +193,25 @@ def main():
     for a_show, label in [(0.0, "BASE (alpha=0)"), (5.0, "STEERED (alpha=+5)")]:
         r = run_once(a_show)
         show_top(r["logits"], label)
+
+    # ---- Generation determinism test ----
+    gen_prompt = "What is 17 + 25? Answer with a single number."
+    max_new = 20
+
+    print("\n" + "=" * 60)
+    print("GENERATION DETERMINISM TEST")
+    print("=" * 60)
+    print(f"Prompt: {gen_prompt!r}")
+    print(f"max_new_tokens: {max_new}")
+
+    out1 = run_once_generate(model, tokenizer, gen_prompt, max_new_tokens=max_new)
+    out2 = run_once_generate(model, tokenizer, gen_prompt, max_new_tokens=max_new)
+
+    assert torch.equal(out1["tokens"], out2["tokens"]), \
+        "NON-DETERMINISTIC: token ids differ"
+    torch.testing.assert_close(out1["scores"], out2["scores"], rtol=0, atol=0)
+    print("PASS: tokens and scores are bitwise identical across two runs.")
+    print(f"Generated: {tokenizer.decode(out1['tokens'], skip_special_tokens=True)!r}")
 
 
 if __name__ == "__main__":
