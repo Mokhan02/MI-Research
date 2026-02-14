@@ -47,13 +47,17 @@ def topk_jaccard(logits_a: torch.Tensor, logits_b: torch.Tensor, k: int = 50) ->
 
 @torch.no_grad()
 def forward_last_logits(model, tokenizer, prompt: str, prehook=None):
+    """Returns (logits_last_fp32, input_ids, resid_last_fp32)."""
     device = next(model.parameters()).device
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     handle = prehook() if prehook else None
-    out = model(**inputs)
+    out = model(**inputs, output_hidden_states=True)
     if handle is not None:
         handle.remove()
-    return out.logits[0, -1, :].float().detach(), inputs["input_ids"][0]
+    logits = out.logits[0, -1, :].float().detach()
+    # Final hidden state at last position (after all layers + final norm)
+    resid_last = out.hidden_states[-1][0, -1, :].float().detach()
+    return logits, inputs["input_ids"][0], resid_last
 
 def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir: torch.Tensor):
     ran = {"ok": False}
@@ -186,18 +190,25 @@ def main():
     alphas = [float(x) for x in args.alphas.split(",")]
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
 
+    # lm_head weight for fp32 target logit computation
+    lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
+
     rows = []
 
     for pi, prow in dfp.iterrows():
         prompt = prow["prompt"]
         target_id = encode_target(tokenizer, prow.get("target", np.nan))
 
-        base_logits, input_ids = forward_last_logits(model, tokenizer, prompt)
+        base_logits, input_ids, base_resid = forward_last_logits(model, tokenizer, prompt)
         seq_len = int(input_ids.shape[0])
         pos = seq_len - 1
 
         if target_id is None:
             target_id = int(torch.argmax(base_logits).item())
+
+        # fp32 baseline target logit from residual
+        w_t = lm_head_w[target_id]  # [d_model] fp32
+        base_t = torch.dot(base_resid, w_t)  # fp32 scalar
 
         for fid in feature_ids:
             steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
@@ -205,14 +216,19 @@ def main():
             for alpha in alphas_sorted:
                 if alpha == 0.0:
                     steer_logits = base_logits
+                    steer_resid = base_resid
                     hook_ran = True
                 else:
                     mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pos, steer_dir)
-                    steer_logits, _ = forward_last_logits(model, tokenizer, prompt, prehook=mk_hook)
+                    steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, prompt, prehook=mk_hook)
                     hook_ran = cap["ok"]
 
+                # fp32 delta_logit_target from residuals
+                steer_t = torch.dot(steer_resid, w_t)
+                delta_target = float((steer_t - base_t).item())
+
+                # Off-target metrics still from full logits
                 d = steer_logits - base_logits
-                delta_target = float(d[target_id].item())
                 max_abs = float(d.abs().max().item())
                 tv = tv_distance_from_logits(base_logits, steer_logits)
                 kl = kl_pq_from_logits(base_logits, steer_logits)
