@@ -142,31 +142,40 @@ def main():
     ALPHAS = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, -1.0, -2.0, -5.0]
     captured_resid = []
 
+    captured_resid_pre = []  # pre-steering residual
+    captured_resid_post = [] # post-steering residual
+
     def make_hook(alpha_val):
         def hook_fn(module, inp, outp):
             t = _get_main_tensor(outp)
+            captured_resid_pre.append(t.detach())
             vec = W_dec[fid].to(dtype=t.dtype)
             t2 = t.clone()
             t2[:, -1, :] = t2[:, -1, :] + alpha_val * vec
-            captured_resid.append(t2.detach())
+            captured_resid_post.append(t2.detach())
             if isinstance(outp, tuple):
                 return (t2,) + outp[1:]
             return t2
         return hook_fn
 
     def run_once(alpha_val):
-        """Single forward pass with steering. Returns dict with logits, tokens (greedy), resid_last."""
-        captured_resid.clear()
+        """Single forward pass with steering. Returns dict with logits, tokens, resid_pre, resid_post, full_logits."""
+        captured_resid_pre.clear()
+        captured_resid_post.clear()
         handle = hook_module.register_forward_hook(make_hook(alpha_val))
         with torch.no_grad():
             out = model(**inputs)
-            logits = out.logits[0, -1].float()  # last position logits, float32
+            full_logits = out.logits.float()       # [1, seq, vocab]
+            logits = full_logits[0, -1]             # last position
         handle.remove()
-        if not captured_resid:
+        if not captured_resid_post:
             raise RuntimeError("Hook did not capture residual")
-        resid_last = captured_resid[0][0, -1, :].float()
-        tokens = logits.argmax(dim=-1, keepdim=True)  # greedy next token
-        return {"logits": logits, "tokens": tokens, "resid_last": resid_last}
+        resid_pre = captured_resid_pre[0][0, -1, :].float()
+        resid_post = captured_resid_post[0][0, -1, :].float()
+        tokens = logits.argmax(dim=-1, keepdim=True)
+        return {"logits": logits, "tokens": tokens,
+                "resid_last": resid_post, "resid_pre": resid_pre,
+                "full_logits": full_logits}
 
     print()
     print("PROMPT:", repr(prompt))
@@ -193,6 +202,27 @@ def main():
     )
     fid = int(top_idx[0].item())
     print(f"\nUsing feature_id={fid} (most active) for steering next.\n")
+
+    # ---- Manual vs model logit diagnostic ----
+    print("=== Manual vs model logit diagnostic (alpha=5.0) ===")
+    r_base = run_once(0.0)
+    r_steer = run_once(5.0)
+    resid_pre = r_base["resid_pre"]
+    resid_post = r_steer["resid_post"]
+    manual_base = torch.dot(resid_pre, lm_head_w[tid]).item()
+    manual_steer = torch.dot(resid_post, lm_head_w[tid]).item()
+    manual_dlogit = manual_steer - manual_base
+    print(f"MANUAL base/steer/delta: {manual_base:.4f} {manual_steer:.4f} {manual_dlogit:+.4f}")
+    print(f"MODEL  logit[-1, tid]:   base={r_base['logits'][tid].item():.4f}  steer={r_steer['logits'][tid].item():.4f}  Δ={r_steer['logits'][tid].item() - r_base['logits'][tid].item():+.4f}")
+
+    # Brute-force correct position
+    T = r_steer["full_logits"].shape[1]
+    print(f"\nBrute-force position scan (seq_len={T}):")
+    for p in range(max(0, T - 4), T):
+        base_l = r_base["full_logits"][0, p, tid].item()
+        steer_l = r_steer["full_logits"][0, p, tid].item()
+        print(f"  pos={p}  base={base_l:.4f}  steer={steer_l:.4f}  Δ={steer_l - base_l:+.4f}")
+    print()
 
     # ---- Run alpha grid, capture resid, compute z/act/logit/projection ----
     results = []
