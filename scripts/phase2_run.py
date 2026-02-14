@@ -79,29 +79,33 @@ def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir:
     return _mk, ran
 
 def encode_target(tokenizer, t):
-    # handle NaN / None
-    if t is None:
+    if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t.strip() == ""):
         return None
-    try:
-        # pandas/numpy NaN
-        if isinstance(t, float) and np.isnan(t):
-            return None
-    except Exception:
-        pass
 
-    # force to string (fixes int targets)
+    # If it's numeric, force string
+    if isinstance(t, (int, np.integer, float, np.floating)):
+        # if it's float but integer-valued, make it clean
+        if isinstance(t, (float, np.floating)) and float(t).is_integer():
+            t = str(int(t))
+        else:
+            t = str(t)
+
+    # If it's pandas scalar
+    if isinstance(t, (pd.Timestamp, pd.Timedelta)):
+        t = str(t)
+
+    # Now must be str
     t = str(t)
 
-    # empty string?
-    if t.strip() == "":
-        return None
-
-    # Gemma-like tokenizers often want a leading space for word-boundary tokens
+    # Tokenizers often expect leading space for "word" tokens
     if not t.startswith(" "):
         t = " " + t
 
     ids = tokenizer.encode(t, add_special_tokens=False)
-    return ids[0] if len(ids) == 1 else None
+    if len(ids) != 1:
+        # Multi-token target: return first token (best effort)
+        pass
+    return ids[0]
 
 def _find_alpha_star(df_direction, prompts, threshold_fn, alphas_ordered):
     """
