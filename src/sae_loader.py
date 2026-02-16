@@ -132,6 +132,12 @@ def load_gemmascope_decoder(cfg: dict) -> Tuple[torch.Tensor, dict]:
         metadata: dict with npz_keys, chosen_key, transposed, decoder_shape.
     """
     sae = cfg.get("sae", {})
+    sae_id = sae.get("sae_id")
+    if sae_id in ("TBD", "", None):
+        raise ValueError(
+            "sae.sae_id must be set to a concrete identifier (e.g. 20-gemmascope-res-16k/2263). "
+            f"Got: {sae_id!r}. No mercy: every run must be reproducible."
+        )
     arch = cfg.get("architecture", {})
     repo_id = sae.get("weights_repo")
     file_path = sae.get("weights_path")

@@ -15,7 +15,7 @@ model:
 sae:
   source: "neuronpedia"
   sae_set: "gemmascope-res-16k"
-  sae_id: "TBD"  # Neuronpedia: 20-gemmascope-res-16k/2263
+  sae_id: "20-gemmascope-res-16k/2263"
   layer_idx: 20
   hook_point: "blocks.20.hook_resid_post"  # TransformerLens-style; maps to model.layers.20
   normalize_decoder: true
@@ -39,16 +39,22 @@ sae_specs:
 
 # Feature selection for this target
 features:
-  n_features: 300  # Sample size for experiment
-  selection_mode: "uniform"  # Start with uniform, can switch to stratified later
-  activation_stats_path: null  # TODO: Generate activation stats for stratified sampling
+  n_features: 300
+  selection_mode: "uniform"  # Uniform over [0, n_features_total); seed in experiment.seed
+  activation_stats_path: null  # When null: no stratification
+  selected_features_file: "outputs/selected_features.json"
 
-# Steering parameters (from base config)
+# On-target steering only
 steering:
-  alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 2.0, 5.0, 10.0]
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
   threshold_T: 0.10
-  alpha0: 1.0
-  tau: 0.05
+
+# On-target benchmark (required for reproducible alpha*)
+benchmark:
+  name: "arithmetic_only"  # or SALADBench / xdom_facts / etc.
+  prompt_count: 200        # Override per run via --n_prompts if needed
+  prompt_csv: "data/arithmetic_only.csv"
+  prompt_template: "prompt + target columns; target optional, fallback top-1"
 
 # Experiment metadata
 experiment:

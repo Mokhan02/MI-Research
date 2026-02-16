@@ -109,15 +109,45 @@ def encode_target(tokenizer, t):
         pass
     return ids[0]
 
-def _find_alpha_star(df_direction, prompts, threshold_fn, alphas_ordered):
+def find_alpha_star_feature_level(df_feat: pd.DataFrame, T: float, direction: int = +1):
     """
-    Scan alphas in order of increasing |alpha|.  For each prompt, find the
-    first alpha where threshold_fn(delta) is True.
+    Feature-level alpha*: smallest |alpha| where mean(delta_logit_target) crosses threshold.
+    direction = +1 (up) uses alpha>0 and delta>=T
+    direction = -1 (down) uses alpha<0 and delta<=-T
+    Returns dict with alpha_star (magnitude), censored, curve table.
+    """
+    assert direction in (+1, -1)
 
-    Returns: dict  prompt_idx -> (alpha_star, tv_at_crossing)
-    Both values come from the SAME run_rows row.
+    df = df_feat.copy()
+    df = df[df["alpha"] != 0]  # alpha=0 is baseline, mean delta should be ~0
+
+    if direction == +1:
+        df = df[df["alpha"] > 0]
+        curve = df.groupby("alpha")["delta_logit_target"].mean()
+        curve = curve.reindex(sorted(curve.index, key=lambda a: abs(a)))
+        crossed = curve[curve >= T]
+    else:
+        df = df[df["alpha"] < 0]
+        curve = df.groupby("alpha")["delta_logit_target"].mean()
+        curve = curve.reindex(sorted(curve.index, key=lambda a: abs(a)))
+        crossed = curve[curve <= -T]
+
+    if len(curve) == 0:
+        return {"alpha_star": np.nan, "censored": True, "curve": curve}
+
+    if len(crossed) == 0:
+        amax = float(np.max(np.abs(curve.index.to_numpy())))
+        return {"alpha_star": amax, "censored": True, "curve": curve}
+
+    a_star = float(np.abs(crossed.index[0]))
+    return {"alpha_star": a_star, "censored": False, "curve": curve}
+
+
+def find_alpha_star_per_prompt(df_direction: pd.DataFrame, prompts, threshold_fn, alphas_ordered):
     """
-    # Index df by (prompt_idx, alpha) for fast lookup
+    Diagnostic: per-prompt alpha* (smallest |alpha| where threshold_fn(delta) is True).
+    Returns dict prompt_idx -> alpha_star (magnitude only, no TV).
+    """
     keyed = df_direction.set_index(["prompt_idx", "alpha"])
     hits = {}
     for pidx in prompts:
@@ -125,16 +155,15 @@ def _find_alpha_star(df_direction, prompts, threshold_fn, alphas_ordered):
             if (pidx, a) not in keyed.index:
                 continue
             row = keyed.loc[(pidx, a)]
-            # row could be a Series (single match) or DataFrame (shouldn't happen
-            # with unique (prompt, feature, alpha) but be safe)
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
             if threshold_fn(row["delta_logit_target"]):
-                hits[pidx] = (abs(a), row["tv_distance"])
+                hits[pidx] = float(np.abs(a))
                 break
     return hits
 
-def _monotone_fraction(df_direction, prompts, alphas_ordered, sign=1):
+
+def monotone_fraction(df_direction, prompts, alphas_ordered, sign=1):
     """
     For each prompt, check how many consecutive alpha steps show
     delta moving in the expected direction (sign=+1: increasing, sign=-1: decreasing).
@@ -164,79 +193,79 @@ def _monotone_fraction(df_direction, prompts, alphas_ordered, sign=1):
             n_mono_prompts += 1
     return n_mono_prompts / n_total if n_total > 0 else np.nan
 
-def summarize_feature_directional(df_feat, tau: float):
+def summarize_feature_directional(df_feat: pd.DataFrame, T: float):
     """
     df_feat: run_rows filtered to a single feature_id (all prompts, all alphas).
 
     Directional convention:
-      - success_up   uses positive alphas:  delta_logit_target >= +tau
-      - success_down uses negative alphas:  delta_logit_target <= -tau
+      - success_up   uses positive alphas:  delta_logit_target >= +T
+      - success_down uses negative alphas:  delta_logit_target <= -T
 
-    alpha_star is found by explicit scan in order of increasing |alpha|.
-    tv_at_alpha_star comes from the exact same (prompt, feature, alpha) row.
-
-    Also computes sign consistency (monotone_frac_up/down): fraction of
-    prompts where >= 2/3 of consecutive alpha steps are monotone in the
-    expected direction.
+    Produces:
+      - alpha_star_feature_up/down (official): smallest |alpha| where mean(delta) crosses ±T
+      - alpha_star_prompt_mean_up/down (diagnostic): mean of per-prompt crossing alphas
+      - censored_up/down: True if mean never crossed threshold in range
+      - monotone_frac_up/down: fraction of prompts with >= 2/3 monotone steps
     """
-    pos = df_feat[df_feat["alpha"] > 0].copy()
-    neg = df_feat[df_feat["alpha"] < 0].copy()
     prompts = df_feat["prompt_idx"].unique()
 
-    # Explicit alpha orderings by increasing |alpha|
+    pos = df_feat[df_feat["alpha"] > 0].copy()
+    neg = df_feat[df_feat["alpha"] < 0].copy()
+
     pos_alphas = sorted(pos["alpha"].unique(), key=lambda a: abs(a))
     neg_alphas = sorted(neg["alpha"].unique(), key=lambda a: abs(a))
 
-    result = dict(
-        success_rate_up=0.0,
-        success_rate_down=0.0,
-        alpha_star_mean_up=np.nan,
-        alpha_star_mean_down=np.nan,
-        tv_at_alpha_star_up=np.nan,
-        tv_at_alpha_star_down=np.nan,
+    out = dict(
+        success_rate_up=np.nan,
+        success_rate_down=np.nan,
+
+        # OFFICIAL: feature-level alpha*
+        alpha_star_feature_up=np.nan,
+        alpha_star_feature_down=np.nan,
+        censored_up=True,
+        censored_down=True,
+
+        # DIAGNOSTIC: per-prompt alpha* mean
+        alpha_star_prompt_mean_up=np.nan,
+        alpha_star_prompt_mean_down=np.nan,
+
         monotone_frac_up=np.nan,
         monotone_frac_down=np.nan,
     )
 
-    # --- UP direction (positive alphas, delta >= +tau) ---
     if len(pos) > 0:
         mx = pos.groupby("prompt_idx")["delta_logit_target"].max()
-        succ_up = (mx >= tau)
-        result["success_rate_up"] = float(succ_up.mean())
+        out["success_rate_up"] = float((mx >= T).mean())
 
-        hits_up = _find_alpha_star(
-            pos, prompts,
-            threshold_fn=lambda d: d >= tau,
-            alphas_ordered=pos_alphas,
+        feat_up = find_alpha_star_feature_level(df_feat, T=T, direction=+1)
+        out["alpha_star_feature_up"] = feat_up["alpha_star"]
+        out["censored_up"] = feat_up["censored"]
+
+        hits_up = find_alpha_star_per_prompt(
+            pos, prompts, threshold_fn=lambda d: d >= T, alphas_ordered=pos_alphas
         )
         if hits_up:
-            result["alpha_star_mean_up"] = nanmean_or_nan([v[0] for v in hits_up.values()])
-            result["tv_at_alpha_star_up"] = nanmean_or_nan([v[1] for v in hits_up.values()])
+            out["alpha_star_prompt_mean_up"] = float(np.nanmean(list(hits_up.values())))
 
-        result["monotone_frac_up"] = _monotone_fraction(
-            pos, prompts, pos_alphas, sign=+1,
-        )
+        out["monotone_frac_up"] = monotone_fraction(pos, prompts, pos_alphas, sign=+1)
 
-    # --- DOWN direction (negative alphas, delta <= -tau) ---
     if len(neg) > 0:
         mn = neg.groupby("prompt_idx")["delta_logit_target"].min()
-        succ_down = (mn <= -tau)
-        result["success_rate_down"] = float(succ_down.mean())
+        out["success_rate_down"] = float((mn <= -T).mean())
 
-        hits_down = _find_alpha_star(
-            neg, prompts,
-            threshold_fn=lambda d: d <= -tau,
-            alphas_ordered=neg_alphas,  # [-1, -2, -5, ...] by increasing |alpha|
+        feat_down = find_alpha_star_feature_level(df_feat, T=T, direction=-1)
+        out["alpha_star_feature_down"] = feat_down["alpha_star"]
+        out["censored_down"] = feat_down["censored"]
+
+        hits_down = find_alpha_star_per_prompt(
+            neg, prompts, threshold_fn=lambda d: d <= -T, alphas_ordered=neg_alphas
         )
         if hits_down:
-            result["alpha_star_mean_down"] = nanmean_or_nan([v[0] for v in hits_down.values()])
-            result["tv_at_alpha_star_down"] = nanmean_or_nan([v[1] for v in hits_down.values()])
+            out["alpha_star_prompt_mean_down"] = float(np.nanmean(list(hits_down.values())))
 
-        result["monotone_frac_down"] = _monotone_fraction(
-            neg, prompts, neg_alphas, sign=-1,
-        )
+        out["monotone_frac_down"] = monotone_fraction(neg, prompts, neg_alphas, sign=-1)
 
-    return result
+    return out
 
 # --------------------------
 # Main
@@ -252,13 +281,12 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
-    ap.add_argument("--prompt_csv", type=str, default="data/phase2_prompts.csv")
+    ap.add_argument("--prompt_csv", type=str, default=None, help="Override benchmark.prompt_csv from config")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2")
     ap.add_argument("--layer", type=int, default=20)
-    ap.add_argument("--n_prompts", type=int, default=200)
+    ap.add_argument("--n_prompts", type=int, default=None, help="Override benchmark.prompt_count from config")
     ap.add_argument("--n_features", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--tau", type=float, default=0.5)
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--alphas", type=str, default="-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40",
                         help="Comma-separated alpha values, e.g. -40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
@@ -272,15 +300,39 @@ def main():
     set_determinism(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Load config first (needed for defaults and SAE assertion)
+    config = resolve_config(load_config(args.config), run_id="phase2_run")
+    sae_id = config.get("sae", {}).get("sae_id")
+    if sae_id in ("TBD", "", None):
+        raise ValueError(
+            "config sae.sae_id must be set to a concrete identifier (e.g. 20-gemmascope-res-16k/2263). "
+            f"Got: {sae_id!r}. No mercy: every run must be reproducible."
+        )
+
+    # CLI overrides config; config must be sufficient to run
+    bench = config.get("benchmark", {})
+    prompt_csv = args.prompt_csv or bench.get("prompt_csv")
+    if not prompt_csv:
+        raise ValueError("Either pass --prompt_csv or set benchmark.prompt_csv in config")
+    n_prompts = args.n_prompts if args.n_prompts is not None else bench.get("prompt_count")
+    if n_prompts is None:
+        n_prompts = 200
+    n_prompts = int(n_prompts)
+
+    # Steering threshold (single concept: delta_logit_target >= T)
+    threshold_T = float(config["steering"]["threshold_T"])
+
     # Load prompts
-    dfp = pd.read_csv(args.prompt_csv, dtype={"prompt": "string", "target": "string"})
+    dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string", "target": "string"})
     assert "prompt" in dfp.columns, "prompt_csv must have a 'prompt' column"
     if "target" not in dfp.columns:
         dfp["target"] = np.nan
-    dfp = dfp.head(args.n_prompts).reset_index(drop=True)
-
-    # Load model via config
-    config = resolve_config(load_config(args.config), run_id="phase2_run")
+    # Official: every prompt must have an explicit target; drop prompts without one
+    dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str).str.strip() != "")
+    dfp = dfp[dfp["_has_target"]].drop(columns=["_has_target"]).reset_index(drop=True)
+    dfp = dfp.head(n_prompts).reset_index(drop=True)
+    if len(dfp) == 0:
+        raise ValueError("No prompts with explicit target in prompt_csv. Official runs require a non-null target per prompt.")
     config["model"]["do_sample"] = False
     config["model"]["temperature"] = 0.0
     model, tokenizer = load_model(config)
@@ -304,6 +356,12 @@ def main():
     else:
         rng = np.random.default_rng(args.seed)
         feature_ids = rng.choice(n_feats_total, size=min(args.n_features, n_feats_total), replace=False).tolist()
+
+    # Freeze selected features for reproducibility (run start)
+    selected_features_path = Path(args.out_dir) / "selected_features.json"
+    with open(selected_features_path, "w") as f:
+        json.dump({"feature_ids": feature_ids, "n_features": len(feature_ids), "seed": args.seed}, f, indent=2)
+    print(f"Wrote {selected_features_path}")
 
     alphas = [float(x) for x in args.alphas.split(",")]
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
@@ -427,12 +485,25 @@ def main():
 
     df = pd.read_csv(run_csv)
 
+    # Sanity gate: alpha=0 must yield ~0 deltas (steer_t - base_t at alpha=0)
+    df_alpha0 = df[df["alpha"] == 0.0]
+    if len(df_alpha0) > 0:
+        ok = (df_alpha0["delta_logit_target"].abs() < 1e-4)
+        frac_ok = float(ok.mean())
+        if frac_ok < 0.95:
+            raise RuntimeError(
+                f"Alpha=0 sanity failed: only {frac_ok:.1%} of alpha=0 rows have |delta|<1e-4. "
+                "Check hook application or computation path."
+            )
+        print(f"[Sanity] alpha=0: {frac_ok:.1%} of {len(df_alpha0)} rows have |delta|<1e-4")
+
     # -----------------------------------------------------------
     # Aggregate per feature via summarize_feature_directional
     # -----------------------------------------------------------
     summary_rows = []
+    curve_rows = []  # for curves_per_feature.parquet
     for fid, df_feat in df.groupby("feature_id"):
-        d = summarize_feature_directional(df_feat, tau=args.tau)
+        d = summarize_feature_directional(df_feat, T=threshold_T)
 
         # Non-zero alphas for off-target metrics (exclude baseline alpha=0)
         df_nonzero = df_feat[df_feat["alpha"] != 0.0]
@@ -468,20 +539,40 @@ def main():
         }
         summary_rows.append(row)
 
+        # Curves per feature: (feature_id, alpha, mean_delta, std_delta, n_prompts)
+        for alpha_val, grp in df_feat.groupby("alpha"):
+            curve_rows.append({
+                "feature_id": fid,
+                "alpha": float(alpha_val),
+                "mean_delta": float(grp["delta_logit_target"].mean()),
+                "std_delta": float(grp["delta_logit_target"].std()) if len(grp) > 1 else 0.0,
+                "n_prompts": int(len(grp)),
+            })
+
     feat_summary = pd.DataFrame(summary_rows)
     alpha_ref = max(alphas, key=lambda a: abs(a))
     summary_path = os.path.join(args.out_dir, "feature_summary.csv")
     feat_summary.to_csv(summary_path, index=False)
 
-    # Meta
-    meta_out = vars(args)
+    # alpha_star.csv (official feature-level alpha* at run end)
+    alpha_star_path = os.path.join(args.out_dir, "alpha_star.csv")
+    alpha_star_df = feat_summary[["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"]].copy()
+    alpha_star_df.to_csv(alpha_star_path, index=False)
+
+    # curves_per_feature.parquet
+    curves_path = os.path.join(args.out_dir, "curves_per_feature.parquet")
+    pd.DataFrame(curve_rows).to_parquet(curves_path, index=False)
+
+    # Meta (include threshold_T for reproducibility)
+    meta_out = vars(args).copy()
     meta_out["n_rows"] = int(len(df))
     meta_out["alpha_ref"] = alpha_ref
+    meta_out["threshold_T"] = threshold_T
     with open(os.path.join(args.out_dir, "meta.json"), "w") as f:
         json.dump(meta_out, f, indent=2)
 
-    print(f"\nWrote:\n- {run_csv}\n- {summary_path}\n- {os.path.join(args.out_dir, 'meta.json')}")
-    print(feat_summary.sort_values(["alpha_star_mean_up", "tv_mean"], ascending=[True, True]).head(15))
+    print(f"\nWrote:\n- {run_csv}\n- {summary_path}\n- {alpha_star_path}\n- {curves_path}\n- {selected_features_path}\n- {os.path.join(args.out_dir, 'meta.json')}")
+    print(feat_summary.sort_values(["alpha_star_feature_up", "tv_mean"], ascending=[True, True]).head(15))
 
 
 if __name__ == "__main__":

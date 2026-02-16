@@ -1,13 +1,13 @@
 # Base configuration for SAE steerability experiments
-
+# Use device: "cpu" only for smoke tests; real runs use "cuda" (or "mps" on Apple Silicon).
 
 experiment:
   name: "sae-steerability"
   seed: 42
 
 model:
-  model_id: "gpt2"  # Using public model for testing
-  device: "cpu"
+  model_id: "gpt2"  # Override in target configs
+  device: "cuda"    # Use "cpu" only for smoke tests
   dtype: "float32"
   max_new_tokens: 64
   temperature: 0.0
@@ -15,18 +15,29 @@ model:
 
 sae:
   source: "neuronpedia"
-  sae_id: "TBD"
+  sae_id: "20-gemmascope-res-16k/2263"
   hook_point: "TBD"
   normalize_decoder: true
-  n_features_total: 1000  # Fallback when SAE loading unavailable
+  n_features_total: 1000  # Override in target configs
 
+# Feature selection: when activation_stats_path is null, stratification is off;
+# selection is pure uniform random over [0, n_features_total) using experiment.seed.
+# The run must save chosen feature IDs at start to selected_features_file for reproducibility.
 features:
   n_features: 300
-  selection_mode: "uniform"
-  activation_stats_path: null
+  selection_mode: "uniform"  # Uniform over feature IDs; seed in experiment.seed
+  activation_stats_path: null  # When null: no stratification, uniform random only
+  selected_features_file: "outputs/selected_features.json"  # Run writes chosen IDs here at start
 
+# On-target steering only. Off-target params (alpha0, tau for breadth, etc.) live in off-target configs.
 steering:
-  alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 2.0, 5.0, 10.0]
-  threshold_T: 0.10
-  alpha0: 1.0
-  tau: 0.05
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]  # Log-ish grid; no ad hoc 0.3, 0.4
+  threshold_T: 0.10  # On-target: min delta for alpha* definition
+
+# On-target benchmark: required for reproducible alpha*.
+# Without this, you cannot reproduce which prompts or format was used.
+benchmark:
+  name: null  # e.g. "SALADBench", "arithmetic_only", "xdom_facts"
+  prompt_count: null  # Number of prompts used
+  prompt_csv: null   # Path to prompt CSV (columns: prompt, target)
+  prompt_template: null  # Optional: description or template ID for formatting
