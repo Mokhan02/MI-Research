@@ -46,14 +46,16 @@ features:
 
 # On-target steering only
 steering:
-  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
   threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
 
 # On-target benchmark (required for reproducible alpha*)
 benchmark:
   name: "arithmetic_only"  # or SALADBench / xdom_facts / etc.
-  prompt_count: 200        # Override per run via --n_prompts if needed
-  prompt_csv: "data/arithmetic_only.csv"
+  prompt_count: 50        # Override per run via --n_prompts if needed
+  prompt_csv: "data/prompts/phase2_arithmetic.csv"
   prompt_template: "prompt + target columns; target optional, fallback top-1"
 
 # Experiment metadata
