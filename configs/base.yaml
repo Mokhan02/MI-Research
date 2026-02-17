@@ -31,7 +31,7 @@ features:
 
 # On-target steering only. Off-target params (alpha0, tau for breadth, etc.) live in off-target configs.
 steering:
-  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]  # Log-ish grid; no ad hoc 0.3, 0.4
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]  # Log-ish grid; negatives auto-added in phase2
   threshold_T: 0.10  # On-target: min delta for alpha* definition
 
 # On-target benchmark: required for reproducible alpha*.
