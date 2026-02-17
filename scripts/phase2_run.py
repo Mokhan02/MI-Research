@@ -290,8 +290,10 @@ def main():
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--alphas", type=str, default=None,
                         help="Override steering.alpha_grid from config (comma-separated, e.g. -10,-5,-1,0,1,5,10)")
+    ap.add_argument("--fixed_features_path", type=str, default=None,
+                        help="Path to selected_features.json (frozen feature set). If set, load feature_ids and skip sampling.")
     ap.add_argument("--feature_ids_file", type=str, default=None,
-                        help="Path to txt with one feature_id per line. If set, overrides random sampling.")
+                        help="Path to txt with one feature_id per line. If set, overrides random sampling (ignored if --fixed_features_path set).")
     ap.add_argument("--heartbeat_every", type=int, default=500)
     ap.add_argument("--flush_every", type=int, default=2000)
     ap.add_argument("--resume", action="store_true", help="Skip tasks already in run_rows.csv")
@@ -353,9 +355,14 @@ def main():
     W_dec = torch.tensor(np.asarray(data["W_dec"], dtype=np.float32), device=device, dtype=torch.float32)
     print(f"W_dec: {W_dec.shape}")
 
-    # Choose features
+    # Choose features (fixed set > txt file > random sampling)
     n_feats_total = W_dec.shape[0]
-    if args.feature_ids_file:
+    if args.fixed_features_path:
+        with open(args.fixed_features_path) as f:
+            data = json.load(f)
+        feature_ids = list(data["feature_ids"])
+        print(f"Loaded {len(feature_ids)} feature IDs from {args.fixed_features_path} (skip sampling)")
+    elif args.feature_ids_file:
         with open(args.feature_ids_file) as f:
             feature_ids = [int(x.strip()) for x in f if x.strip()]
         feature_ids = feature_ids[:args.n_features]

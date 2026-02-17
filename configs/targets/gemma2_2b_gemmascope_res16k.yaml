@@ -53,9 +53,9 @@ steering:
 
 # On-target benchmark (required for reproducible alpha*)
 benchmark:
-  name: "arithmetic_only"  # or SALADBench / xdom_facts / etc.
-  prompt_count: 50        # Override per run via --n_prompts if needed
-  prompt_csv: "data/prompts/phase2_arithmetic.csv"
+  name: "planets_clean"  # or SALADBench / xdom_facts / etc.
+  prompt_count: 500        # Override per run via --n_prompts if needed
+  prompt_csv: "data/prompts/phase2_planets_clean.csv"
   prompt_template: "prompt + target columns; target optional, fallback top-1"
 
 # Experiment metadata
