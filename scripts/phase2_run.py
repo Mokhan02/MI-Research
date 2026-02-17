@@ -288,8 +288,8 @@ def main():
     ap.add_argument("--n_features", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--topk", type=int, default=50)
-    ap.add_argument("--alphas", type=str, default="-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40",
-                        help="Comma-separated alpha values, e.g. -40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40")
+    ap.add_argument("--alphas", type=str, default=None,
+                        help="Override steering.alpha_grid from config (comma-separated, e.g. -10,-5,-1,0,1,5,10)")
     ap.add_argument("--feature_ids_file", type=str, default=None,
                         help="Path to txt with one feature_id per line. If set, overrides random sampling.")
     ap.add_argument("--heartbeat_every", type=int, default=500)
@@ -319,8 +319,15 @@ def main():
         n_prompts = 200
     n_prompts = int(n_prompts)
 
-    # Steering threshold (single concept: delta_logit_target >= T)
+    # Steering threshold and alpha grid (CLI overrides config)
     threshold_T = float(config["steering"]["threshold_T"])
+    if args.alphas is not None:
+        alphas = [float(x) for x in args.alphas.split(",")]
+    else:
+        # Use config steering.alpha_grid; extend with negatives for directional (up/down) runs
+        grid = list(config["steering"]["alpha_grid"])
+        positive = [x for x in grid if x > 0]
+        alphas = sorted(set([0.0] + positive + [-x for x in positive]), key=lambda a: abs(a))
 
     # Load prompts
     dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string", "target": "string"})
@@ -363,7 +370,6 @@ def main():
         json.dump({"feature_ids": feature_ids, "n_features": len(feature_ids), "seed": args.seed}, f, indent=2)
     print(f"Wrote {selected_features_path}")
 
-    alphas = [float(x) for x in args.alphas.split(",")]
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
 
     # lm_head weight for fp32 target logit computation
