@@ -197,15 +197,13 @@ def summarize_feature_directional(df_feat: pd.DataFrame, T: float):
     """
     df_feat: run_rows filtered to a single feature_id (all prompts, all alphas).
 
-    Directional convention:
-      - success_up   uses positive alphas:  delta_logit_target >= +T
-      - success_down uses negative alphas:  delta_logit_target <= -T
+    Success metric: delta_logit_target (steer_t - base_t) >= +T (up) or <= -T (down).
+    T must be pre-registered (set from baseline or pilot, then frozen). Aggregation:
+    feature-level mean(delta) then threshold (alpha* = smallest |alpha| where mean(delta) >= T).
+    Directionality: alpha* is "helpful" (toward target); track wrong-way effects as off-target.
 
-    Produces:
-      - alpha_star_feature_up/down (official): smallest |alpha| where mean(delta) crosses ±T
-      - alpha_star_prompt_mean_up/down (diagnostic): mean of per-prompt crossing alphas
-      - censored_up/down: True if mean never crossed threshold in range
-      - monotone_frac_up/down: fraction of prompts with >= 2/3 monotone steps
+    No-effect (censored): When mean(delta) never crosses threshold, censored_up/down = True.
+    Do NOT set alpha* = max(alpha); treat as no-effect in correlations (see LANDMINES.md).
     """
     prompts = df_feat["prompt_idx"].unique()
 
@@ -297,7 +295,15 @@ def main():
     ap.add_argument("--heartbeat_every", type=int, default=500)
     ap.add_argument("--flush_every", type=int, default=2000)
     ap.add_argument("--resume", action="store_true", help="Skip tasks already in run_rows.csv")
+    ap.add_argument("--micro_sweep", action="store_true",
+                    help="Micro sweep: 10 features, 25 prompts, alpha=[0,.5,1,2,5]. Run this before full K=100.")
     args = ap.parse_args()
+
+    if args.micro_sweep:
+        args.n_features = 10
+        args.n_prompts = 25
+        args.alphas = "0,0.5,1,2,5"
+        print("[Micro sweep] n_features=10, n_prompts=25, alphas=[0,.5,1,2,5]")
 
     set_determinism(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)

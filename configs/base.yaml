@@ -25,9 +25,13 @@ sae:
 # The run must save chosen feature IDs at start to selected_features_file for reproducibility.
 features:
   n_features: 300
-  selection_mode: "uniform"  # Uniform over feature IDs; seed in experiment.seed
-  activation_stats_path: null  # When null: no stratification, uniform random only
-  selected_features_file: "outputs/selected_features.json"  # Run writes chosen IDs here at start
+  selection_mode: "uniform"  # or "contrast_delta" for task − neutral
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features.json"
+  # Activation definition (must be consistent). tau_act=0.0 is often too permissive; audit first.
+  tau_act: 0.01
+  token_span: "last_n"  # "last" with n=1 is formatting-sensitive; prefer last_n=8
+  token_span_last_n: 8
 
 # On-target steering only. Off-target params (alpha0, tau for breadth, etc.) live in off-target configs.
 steering:

@@ -40,9 +40,17 @@ sae_specs:
 # Feature selection for this target
 features:
   n_features: 300
-  selection_mode: "uniform"  # Uniform over [0, n_features_total); seed in experiment.seed
-  activation_stats_path: null  # When null: no stratification
+  selection_mode: "contrast_delta"  # contrast_delta | uniform
+  activation_stats_path: null
   selected_features_file: "outputs/selected_features.json"
+  # Activation definition (must be consistent across domains and runs)
+  # tau_act: 0.0 is usually too permissive (act_freq = fraction act>0 is noisy). Run
+  #   scripts/audit_activation_distribution.py and set tau_act from percentiles or pilot.
+  tau_act: 0.01
+  # token_span "last" with last_n=1 is sensitive to formatting (trailing punct, "Answer:").
+  # Prefer last_n=8 or 16 so you don't select "response formatting" over semantics.
+  token_span: "last_n"
+  token_span_last_n: 8
 
 # On-target steering only
 steering:

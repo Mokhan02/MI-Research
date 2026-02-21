@@ -64,6 +64,20 @@ Results will be in `outputs/$RUN_ID/`:
 - Debugging before real experiments
 - Training team members on the workflow
 
+## Run gates (before full pipeline)
+
+See **GATES.md** for the seven gates in priority order. Summary:
+
+1. **Domain prompt splits** — Use `make_domain_splits.py` to create select/alpha/holdout CSVs per domain (no prompt overlap between selection and evaluation).
+2. **Contrast-based selection** — Top K by Δ = task − neutral (`phase2_select_contrast.py`), not top K act_freq on task.
+3. **Active = act > τ_act on token_span** — Set `tau_act` and `token_span` in config; keep consistent.
+4. **Persist** — feature_summary_*.csv and selected_features_*.json from selection.
+5. **Control set** — randK_matched_actfreq.json (or random K) for comparisons.
+6. **Micro sweep first** — `phase2_run --micro_sweep` (10 features, ~25 prompts, small α grid) before full K=100.
+7. **α* and no-effect** — Success = delta_logit_target ≥ T (T pre-registered). Censored = no-effect (do not set α* = max).
+
+See **LANDMINES.md** for six traps to fix or audit before running (tau_act, token_span, T pre-registration, directionality, control matching, neutral isomorphism).
+
 ## Configuration
 
 All parameters are in `configs/base.yaml`:
