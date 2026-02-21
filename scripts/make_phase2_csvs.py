@@ -1,12 +1,18 @@
 # scripts/make_phase2_csvs.py
 """
-Convert phase2 prompt .txt files into CSVs with (prompt, target) columns.
-Arithmetic prompts get auto-computed targets.
-Capital prompts get auto-derived targets from a country->capital map.
-Others get empty target (model top-1 used as fallback at runtime).
+Build prompt CSVs with (prompt, target) and consistent " Answer:" scaffolding.
+
+- Adds " Answer:" to every prompt so formatting is identical across domains
+  (required for neutral/task contrast and for α* logit-based design).
+- Strips trailing commas from source lines.
+- Only includes rows with non-empty target for planets/capitals (labeled only).
+- Control/neutral: same scaffolding, target empty (structurally isomorphic).
 
 Usage:
   python scripts/make_phase2_csvs.py
+
+Then run domain splits so select/alpha/holdout use these labeled prompts:
+  python scripts/make_domain_splits.py --data_dir data --out_dir data/prompts [--seed 0]
 """
 import re
 import pandas as pd
@@ -15,6 +21,9 @@ from pathlib import Path
 PROMPT_DIR = Path("data/prompts")
 OUT_DIR = Path("data")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Scaffolding: identical across domains so last-token / last-N activations are comparable
+ANSWER_SUFFIX = " Answer:"
 
 # --- Arithmetic ---
 def parse_arith_target(prompt: str) -> str:
@@ -55,6 +64,60 @@ def parse_arith_target(prompt: str) -> str:
             return str(word_to_num[w1] * word_to_num[w2])
 
     return ""
+
+
+# --- Planets (prompt stem -> single-token completion where unambiguous) ---
+PLANET_TARGET_MAP = {
+    "the largest planet in our solar system is": "Jupiter",
+    "the biggest planet is": "Jupiter",
+    "the fifth planet from the sun is": "Jupiter",
+    "the solar system's largest planet is": "Jupiter",
+    "the red spot is on": "Jupiter",
+    "jupiter is the": "largest",
+    "saturn is a": "planet",
+    "earth is the third": "planet",
+    "the moon orbits": "Earth",
+    "venus is the second": "planet",
+    "mercury is the first": "planet",
+    "pluto is a dwarf": "planet",
+    "jupiter is a": "planet",
+    "neptune is a": "planet",
+    "mars is the fourth": "planet",
+    "neptune is the eighth": "planet",
+    "earth orbits the": "Sun",
+    "the sun is at the center of the": "solar",
+    "the solar system includes": "planets",
+    "planets orbit the": "Sun",
+    "europa is a moon of": "Jupiter",
+    "titan orbits": "Saturn",
+    "enceladus is a moon of": "Saturn",
+    "phobos and deimos orbit": "Mars",
+    "iapetus is a moon of": "Saturn",
+    "dione orbits": "Saturn",
+    "proteus orbits": "Neptune",
+    "the kuiper belt is beyond": "Neptune",
+    "venus rotates": "retrograde",
+    "earth is the only": "planet",
+    "the sun is a": "star",
+    "stars are not": "planets",
+    "jupiter is gas": "giant",
+    "saturn is mostly": "hydrogen",
+    "mars is red": "planet",
+    "earth has one": "moon",
+    "the asteroid belt is between": "Mars",
+    "ceres is in the": "asteroid",
+    "a planet has a round": "shape",
+    "orbits are": "elliptical",
+    "neptune is blue": "planet",
+    "uranus is an ice": "giant",
+}
+
+
+def parse_planet_target(prompt: str) -> str:
+    """Return single-token target for planet prompt if known, else ""."""
+    stem = prompt.strip().rstrip(",").lower()
+    return PLANET_TARGET_MAP.get(stem, "")
+
 
 # --- Capitals ---
 CAPITAL_MAP = {
@@ -97,28 +160,39 @@ def parse_capital_target(prompt: str) -> str:
     return ""
 
 
-def txt_to_csv(txt_path: Path, csv_path: Path, target_fn=None):
-    """Convert txt to csv. target_fn(prompt)->str, or None for empty target."""
-    lines = [l.strip() for l in txt_path.read_text().splitlines() if l.strip()]
+def _norm_line(line: str) -> str:
+    """Strip and remove trailing comma so 'Jupiter is the,' -> 'Jupiter is the'."""
+    return line.strip().rstrip(",").strip()
+
+
+def txt_to_csv(txt_path: Path, csv_path: Path, target_fn=None, labeled_only: bool = False):
+    """
+    Convert txt to csv with prompt = line + ANSWER_SUFFIX, target from target_fn(line).
+    If labeled_only=True, only write rows where target is non-empty.
+    """
+    lines = [_norm_line(l) for l in txt_path.read_text().splitlines() if _norm_line(l)]
     rows = []
-    for p in lines:
-        t = target_fn(p) if target_fn else ""
-        rows.append({"prompt": p, "target": t})
+    for line in lines:
+        prompt = line + ANSWER_SUFFIX
+        t = target_fn(line) if target_fn else ""
+        if labeled_only and not t:
+            continue
+        rows.append({"prompt": prompt, "target": t})
     df = pd.DataFrame(rows)
     df.to_csv(csv_path, index=False)
-    n_with_target = (df["target"] != "").sum()
-    print(f"Wrote {len(rows)} rows ({n_with_target} with target) -> {csv_path}")
+    n_with = (df["target"] != "").sum() if len(df) > 0 else 0
+    print(f"Wrote {len(rows)} rows ({n_with} with target) -> {csv_path}")
 
 
 def main():
     txt_to_csv(PROMPT_DIR / "phase2_arithmetic.txt", OUT_DIR / "arithmetic_only.csv",
-               target_fn=parse_arith_target)
-    txt_to_csv(PROMPT_DIR / "phase2_capitals.txt",   OUT_DIR / "capitals_only.csv",
-               target_fn=parse_capital_target)
-    txt_to_csv(PROMPT_DIR / "phase2_planets.txt",     OUT_DIR / "planets_only.csv",
-               target_fn=None)
-    txt_to_csv(PROMPT_DIR / "phase2_control.txt",     OUT_DIR / "control_only.csv",
-               target_fn=None)
+               target_fn=parse_arith_target, labeled_only=False)
+    txt_to_csv(PROMPT_DIR / "phase2_capitals.txt", OUT_DIR / "capitals_only.csv",
+               target_fn=parse_capital_target, labeled_only=True)
+    txt_to_csv(PROMPT_DIR / "phase2_planets.txt", OUT_DIR / "planets_only.csv",
+               target_fn=parse_planet_target, labeled_only=True)
+    txt_to_csv(PROMPT_DIR / "phase2_control.txt", OUT_DIR / "control_only.csv",
+               target_fn=None, labeled_only=False)
 
 
 if __name__ == "__main__":
