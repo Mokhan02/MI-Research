@@ -377,6 +377,9 @@ def main():
         rng = np.random.default_rng(args.seed)
         feature_ids = rng.choice(n_feats_total, size=min(args.n_features, n_feats_total), replace=False).tolist()
 
+    # One row per (prompt, feature, alpha): no duplicate feature_ids
+    feature_ids = list(dict.fromkeys(feature_ids))
+
     # Freeze selected features for reproducibility (run start)
     selected_features_path = Path(args.out_dir) / "selected_features.json"
     with open(selected_features_path, "w") as f:
@@ -406,8 +409,8 @@ def main():
             seq_len=seq_len, pos=pos, target_id=target_id, w_t=w_t, base_t=base_t,
         )
 
-    # Flat iterator over all (prompt, feature, alpha) jobs
-    all_jobs = list(product(dfp.index, feature_ids, alphas_sorted))
+    # Flat iterator: exactly one job per (prompt, feature, alpha); no direction doubling
+    all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
     total_tasks = len(all_jobs)
     run_csv = Path(args.out_dir) / "run_rows.csv"
     start_time = time.time()
@@ -502,7 +505,14 @@ def main():
         df_out.to_csv(run_csv, mode="a", header=header, index=False)
         print(f"[Flush] wrote {len(buffer)} rows -> {run_csv}")
 
+    # One row per (prompt_idx, feature_id, alpha): no double-write per direction
     df = pd.read_csv(run_csv)
+    key_cols = ["prompt_idx", "feature_id", "alpha"]
+    dupes = df.duplicated(subset=key_cols, keep="first")
+    if dupes.any():
+        n_dup = int(dupes.sum())
+        df = df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
+        print(f"[Fix] Dropped {n_dup} duplicate (prompt_idx, feature_id, alpha) rows; {len(df)} rows remain. TASK vs CTRL must have identical row counts.")
 
     # Sanity gate: alpha=0 must yield ~0 deltas (steer_t - base_t at alpha=0)
     df_alpha0 = df[df["alpha"] == 0.0]
