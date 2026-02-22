@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.config import load_and_resolve_config
+from src.config import load_config, resolve_config
 from src.model_utils import load_model_and_tokenizer
 from src.sae_loader import load_sae_decoder
 
@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
-    config = load_and_resolve_config(args.config, run_id="alignment")
+    config = resolve_config(load_config(args.config), run_id="alignment")
     if args.device:
         config["model"]["device"] = args.device
 
