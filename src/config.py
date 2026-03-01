@@ -42,10 +42,11 @@ def resolve_config(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         raise ValueError("Config must contain 'steering' section")
     
     steering = resolved["steering"]
-    required_params = ["alpha_grid", "threshold_T", "alpha0", "tau"]
+    required_params = ["alpha_grid", "threshold_T"]
     for param in required_params:
         if param not in steering:
             raise ValueError(f"Config must contain steering.{param}")
+    # alpha0, tau are for off-target scripts only; not required in on-target configs
     
     # Validate alpha_grid
     alpha_grid = steering["alpha_grid"]

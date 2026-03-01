@@ -4,65 +4,33 @@
 
 This is an experiment pipeline that studies **SAE feature steerability** in language models. The core question: *Can we predict how difficult it is to steer a feature and what side effects it will have, based solely on the feature's geometric properties measured before any intervention?*
 
-The pipeline runs 5 sequential stages:
-1. **Feature Selection** - Pick 300 SAE features to study
-2. **Pre-Steering Metrics** - Compute geometric/usage metrics (cosine similarity, neighbor density, co-activation)
-3. **Steerability Measurement** - Find the minimum steering coefficient α* needed to achieve target behavioral change
-4. **Off-Target Risk** - Measure collateral effects on unrelated benchmarks
-5. **Analysis** - Merge data, run correlations, train predictive models, generate plots
+**Real pipeline (use only these):**
+1. **Feature selection** — `phase2_select_contrast.py` (contrast: task − neutral); outputs `selected_features_planets.json`, feature summaries.
+2. **Steerability** — `phase2_run.py` (real SAE decoder, α-grid, delta_logit_target, α*, censoring); uses config + prompt CSV with matched features/prompts.
+3. **Prediction** — `phase3_predictability.py` / `phase3_predict_cv*.py` (correlate geometry with α*).
+4. **Off-target** — To be run on Phase 2 outputs with real SAE (no script in main pipeline yet; old 04 was placeholder).
+
+**Do not run scripts in `scripts/legacy/`.** They are the old 01–05 pipeline: fake SAE (`load_sae`), fake steering, fake scores. Any results from them would be fabricated. They are archived so nobody runs them by accident.
 
 ## Quick Start
 
 ### Prerequisites
 - Python 3.11-3.12
-- `uv` package manager (install from https://github.com/astral-sh/uv)
+- `uv` or `PYTHONPATH=.` for running scripts
 
-### Setup
+### Setup and run (real pipeline)
 ```bash
-# Clone the repo
-git clone <repo-url>
-cd MI-Research
-
 # Install dependencies
 uv sync
 
-# Run the pipeline
-RUN_ID="my_experiment"
-uv run python scripts/01_choose_features.py --run-id $RUN_ID
-uv run python scripts/02_presteering_metrics.py --run-id $RUN_ID
-uv run python scripts/03_steerability.py --run-id $RUN_ID
-uv run python scripts/04_offtarget.py --run-id $RUN_ID
-uv run python scripts/05_analysis.py --run-id $RUN_ID
+# 1. Contrast feature selection (uses real model + SAE)
+PYTHONPATH=. python scripts/phase2_select_contrast.py --config configs/targets/gemma2_2b_gemmascope_res16k.yaml --domain planets --out_dir outputs/phase2_select --top-k 100
+
+# 2. Measure steerability (real SAE, matched features + prompts)
+PYTHONPATH=. python scripts/phase2_run.py --config configs/targets/gemma2_2b_gemmascope_res16k.yaml --out_dir outputs/phase2 --n_prompts 100 --fixed_features_path outputs/phase2_select/selected_features_planets.json
 ```
 
-Results will be in `outputs/$RUN_ID/`:
-- `master.csv` - Complete merged dataset
-- `alpha_star.csv` - Steerability metric per feature
-- `risk.csv` - Off-target risk metrics
-- `plots/` - Visualizations
-- `config_resolved.yaml` - Reproducible config snapshot
-
-## Current Status: Placeholder Mode
-
-**The pipeline runs end-to-end right now**, but uses **placeholder components**:
-
-✅ **What Works:**
-- All 5 scripts execute successfully
-- Pipeline structure and data flow
-- Analysis and visualization
-- File I/O and artifact management
-
-⚠️ **What's Placeholder:**
-- **SAE Loading**: Uses random decoder weights (since `sae_id="TBD"` in config)
-- **Model Hooks**: Logs warnings, doesn't actually hook into model
-- **Benchmark Scoring**: Hash-based proxy scores (not real benchmark scores)
-- **Activation Extraction**: Random placeholder activations
-
-**This means:** The pipeline completes and produces outputs, but the data is synthetic. This is useful for:
-- Testing pipeline structure
-- Verifying code logic
-- Debugging before real experiments
-- Training team members on the workflow
+Results: `outputs/phase2_select/` (feature summaries, selected_features_planets.json), `outputs/phase2/` (run_rows.csv, alpha_star.csv, curves).
 
 ## Run gates (before full pipeline)
 
@@ -105,59 +73,32 @@ steering:
 
 ## For Real Experiments
 
-To run with **real SAE and model data**, you need to:
+- Use **configs/targets/gemma2_2b_gemmascope_res16k.yaml** (real SAE: GemmaScope, `sae_id` set).
+- **SAE loading** is in `src/sae_loader.py` (`load_gemmascope_decoder`). The real pipeline uses this; do not use `load_sae` in `src/model_utils.py` (placeholder).
+- **Feature selection** and **steerability** use matched features and prompts: run `phase2_select_contrast` first, then `phase2_run` with `--fixed_features_path` pointing at its output.
+- Prompt sets: domain splits in `data/prompts/` (`*_select.csv`, `*_alpha.csv`, `*_holdout.csv`); benchmark CSV in config (`benchmark.prompt_csv`).
 
-1. **Set SAE parameters** in `configs/base.yaml`:
-   - `sae_id`: Your SAE identifier
-   - `hook_point`: Layer name (e.g., "model.layers.5")
+## Pipeline Stages (real pipeline)
 
-2. **Implement SAE loading** in `src/model_utils.py:
-   - Replace `load_sae()` placeholder with actual SAE loading code
-   - Currently raises `NotImplementedError` if `sae_id == "TBD"`
+### Feature selection: `phase2_select_contrast.py`
+Contrast-based: top K by Δ = act_freq_task − act_freq_neutral. Uses real model + SAE. Outputs: `selected_features_planets.json`, `feature_summary_planets.csv`, control set.
 
-3. **Implement hook registration** in `scripts/03_steerability.py` and `04_offtarget.py`:
-   - Replace placeholder hook registration with actual module lookup
-   - Currently logs: "Hook registration is a placeholder"
+### Steerability: `phase2_run.py`
+Real SAE decoder, α-grid, delta_logit_target, α* with censoring. Uses prompt CSV with `prompt` + `target`; features from `--fixed_features_path` or random sample. Outputs: `run_rows.csv`, `alpha_star.csv`, `curves_per_feature.parquet`.
 
-4. **Implement benchmark scorers** in `src/scoring.py`:
-   - Replace `PlaceholderScorer` with official scorers
-   - Currently returns deterministic hash-based proxy scores
+### Prediction: `phase3_predictability.py` / `phase3_predict_cv*.py`
+Correlate pre-steering geometry (and usage) with α*. Inputs: Phase 2 outputs + geometry from W_dec or pre-steering metrics.
 
-5. **Add prompt sets** in `data/prompts/`:
-   - `on_target.txt` - For steerability measurement
-   - `gpqa.txt`, `truthfulqa.txt`, `darkbench.txt` - For off-target evaluation
-   - `reference_corpus.txt` - For pre-steering metrics
-
-## Pipeline Stages Explained
-
-### Stage 1: Feature Selection (`01_choose_features.py`)
-Selects 300 SAE features uniformly or via stratified sampling. Outputs: `selected_features.npy`, `features.json`
-
-### Stage 2: Pre-Steering Metrics (`02_presteering_metrics.py`)
-Computes geometric metrics **before any intervention**:
-- Max cosine similarity (nearest neighbor)
-- Neighbor density (local crowding)
-- Co-activation correlation (entanglement)
-Outputs: `pre_metrics.csv`
-
-### Stage 3: Steerability (`03_steerability.py`)
-Sweeps steering coefficient α, finds minimum α* where `score(α) - score(0) ≥ threshold_T`. Outputs: `alpha_star.csv`, `ontarget_curve.csv`
-
-### Stage 4: Off-Target Risk (`04_offtarget.py`)
-Measures side effects at two regimes:
-- At α*(f) - when target effect happens
-- At fixed α₀=1.0 - gentle steering
-Computes R_mag (mean absolute change) and R_breadth (fraction above threshold). Outputs: `risk.csv`
-
-### Stage 5: Analysis (`05_analysis.py`)
-Merges all data, runs correlations, trains predictive models, generates plots. Outputs: `master.csv`, `correlation_results.csv`, `plots/`
+### Archived (do not run): `scripts/legacy/`
+01_choose_features, 02_presteering_metrics, 03_steerability, 04_offtarget, 05_analysis, 10/11/11b/make_feature_sets — fake SAE, fake steering, fake scores. Kept only for reference.
 
 ## Key Files
 
-- `configs/base.yaml` - Central configuration
-- `scripts/01-05_*.py` - Pipeline stages
-- `scripts/99_hook_sanity.py` - Hook mechanism verification
-- `src/` - Reusable utilities (config, model loading, geometry, scoring)
+- `configs/targets/gemma2_2b_gemmascope_res16k.yaml` - Target config (model, SAE, benchmark, steering)
+- `scripts/phase2_select_contrast.py`, `scripts/phase2_run.py` - Core pipeline
+- `scripts/phase3_predictability.py`, `scripts/phase3_predict_cv.py` - Phase 3
+- `src/sae_loader.py` - Real SAE (load_gemmascope_decoder)
+- `src/model_utils.py` - load_model (real); load_sae is placeholder, unused by real pipeline
 - `outputs/<run_id>/` - Experiment results
 
 ## Design Principles

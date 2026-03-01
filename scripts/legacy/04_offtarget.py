@@ -229,9 +229,10 @@ def main():
         name: load_scorer(config, "off_target") for name in benchmarks.keys()
     }
     
-    tau = config["steering"]["tau"]
-    alpha0 = config["steering"]["alpha0"]
-    
+    # Off-target only; not in on-target configs. Use defaults if missing.
+    tau = config["steering"].get("tau", 0.05)
+    alpha0 = config["steering"].get("alpha0", 1.0)
+
     logger.info(f"Evaluating off-target effects for {len(selected_features)} features")
     logger.info(f"Using {len(benchmarks)} off-target benchmarks")
     logger.info(f"tau = {tau}, alpha0 = {alpha0}")

@@ -354,11 +354,11 @@ def main():
     model.eval()
     device = next(model.parameters()).device
 
-    # Load SAE params (same loader as phase1_smoke / debug_steer_effect)
-    _, meta = load_gemmascope_decoder(config)
-    npz_path = meta["npz_path"]
-    data = np.load(npz_path)
-    W_dec = torch.tensor(np.asarray(data["W_dec"], dtype=np.float32), device=device, dtype=torch.float32)
+    # Load SAE decoder (use returned tensor so NPZ key name is not assumed)
+    W_dec, _ = load_gemmascope_decoder(config)
+    W_dec = W_dec.to(device=device, dtype=torch.float32)
+    if config.get("sae", {}).get("normalize_decoder", False):
+        W_dec = W_dec / (W_dec.norm(dim=1, keepdim=True).clamp(min=1e-12))
     print(f"W_dec: {W_dec.shape}")
 
     # Choose features (fixed set > txt file > random sampling)
