@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
 from src.sae_loader import load_gemmascope_decoder
+from src.refusal_scorer import refusal_score as _refusal_score
 
 # --------------------------
 # Utils
@@ -66,6 +67,36 @@ def forward_last_logits(model, tokenizer, prompt: str, prehook=None):
     # Final hidden state at last position (after all layers + final norm)
     resid_last = out.hidden_states[-1][0, -1, :].float().detach()
     return logits, inputs["input_ids"][0], resid_last
+
+@torch.no_grad()
+def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, prehook=None):
+    """Generate a short response with optional steering hook. Returns generated text (excluding prompt)."""
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    handle = prehook() if prehook else None
+    out_ids = model.generate(
+        **inputs, max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0,
+    )
+    if handle is not None:
+        handle.remove()
+    gen_ids = out_ids[0, inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+def make_steer_prehook_all_pos(model, layer_idx: int, alpha: float, steer_dir: torch.Tensor):
+    """Steering hook that adds alpha * steer_dir at ALL positions (needed for generation)."""
+    ran = {"ok": False}
+    def _mk():
+        def _prehook(module, inputs):
+            hidden = inputs[0]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            hidden2[:, :, :] = hidden2[:, :, :] + alpha * steer_dir
+            return (hidden2,) + inputs[1:]
+        layer = model.model.layers[layer_idx]
+        return layer.register_forward_pre_hook(_prehook)
+    return _mk, ran
+
 
 def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir: torch.Tensor):
     ran = {"ok": False}
@@ -278,6 +309,8 @@ def main():
             break
 
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", type=str, default="logit", choices=["logit", "refusal"],
+                    help="logit: delta_logit_target (factual QA). refusal: generate + keyword refusal scoring (SALADBench).")
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
     ap.add_argument("--prompt_csv", type=str, default=None, help="Override benchmark.prompt_csv from config")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2")
@@ -338,16 +371,18 @@ def main():
         alphas = sorted(set([0.0] + positive + [-x for x in positive]), key=lambda a: abs(a))
 
     # Load prompts
-    dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string", "target": "string"})
+    dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string"})
     assert "prompt" in dfp.columns, "prompt_csv must have a 'prompt' column"
-    if "target" not in dfp.columns:
-        dfp["target"] = np.nan
-    # Official: every prompt must have an explicit target; drop prompts without one
-    dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str).str.strip() != "")
-    dfp = dfp[dfp["_has_target"]].drop(columns=["_has_target"]).reset_index(drop=True)
+    if args.mode == "logit":
+        if "target" not in dfp.columns:
+            dfp["target"] = np.nan
+        dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str).str.strip() != "")
+        dfp = dfp[dfp["_has_target"]].drop(columns=["_has_target"]).reset_index(drop=True)
+        if len(dfp) == 0:
+            raise ValueError("No prompts with explicit target in prompt_csv. Logit mode requires a non-null target per prompt.")
     dfp = dfp.head(n_prompts).reset_index(drop=True)
     if len(dfp) == 0:
-        raise ValueError("No prompts with explicit target in prompt_csv. Official runs require a non-null target per prompt.")
+        raise ValueError("No usable prompts in prompt_csv.")
     config["model"]["do_sample"] = False
     config["model"]["temperature"] = 0.0
     model, tokenizer = load_model(config)
@@ -388,10 +423,20 @@ def main():
 
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
 
-    # lm_head weight for fp32 target logit computation
+    if args.mode == "logit":
+        _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config)
+    else:
+        _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config)
+
+
+# ===========================================================
+# Logit mode (factual QA: delta_logit_target)
+# ===========================================================
+def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
+    device = next(model.parameters()).device
+
     lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
 
-    # Pre-compute per-prompt baselines (one forward pass each)
     print(f"Computing baselines for {len(dfp)} prompts...")
     prompt_cache = {}
     for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baselines"):
@@ -409,14 +454,12 @@ def main():
             seq_len=seq_len, pos=pos, target_id=target_id, w_t=w_t, base_t=base_t,
         )
 
-    # Flat iterator: exactly one job per (prompt, feature, alpha); no direction doubling
     all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
     total_tasks = len(all_jobs)
     run_csv = Path(args.out_dir) / "run_rows.csv"
     start_time = time.time()
     buffer = []
 
-    # Resume: skip tasks already in run_rows.csv
     done = set()
     if args.resume and run_csv.exists():
         prev = pd.read_csv(run_csv, usecols=["prompt_idx", "feature_id", "alpha"])
@@ -446,43 +489,33 @@ def main():
             if (t1 - t0) > 2.0:
                 print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
 
-        # fp32 delta_logit_target from residuals
         steer_t = torch.dot(steer_resid, pc["w_t"])
         delta_target = float((steer_t - pc["base_t"]).item())
 
-        # Off-target metrics still from full logits
         d = steer_logits - pc["base_logits"]
         max_abs = float(d.abs().max().item())
         tv = tv_distance_from_logits(pc["base_logits"], steer_logits)
         kl = kl_pq_from_logits(pc["base_logits"], steer_logits)
         jac = topk_jaccard(pc["base_logits"], steer_logits, k=args.topk)
 
-        # Stricter metrics: rank change of target token
         tid = pc["target_id"]
         base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
         steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
         target_is_top1 = bool(steer_rank == 1)
 
         row = {
-            "prompt_idx": pi,
-            "feature_id": fid,
-            "alpha": alpha,
-            "seq_len": pc["seq_len"],
-            "target_id": int(tid),
+            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+            "seq_len": pc["seq_len"], "target_id": int(tid),
             "delta_logit_target": delta_target,
-            "tv_distance": tv,
-            "kl_base_to_steer": kl,
-            "topk_jaccard": jac,
-            "max_abs_dlogit": max_abs,
+            "tv_distance": tv, "kl_base_to_steer": kl,
+            "topk_jaccard": jac, "max_abs_dlogit": max_abs,
             "hook_ran": bool(hook_ran),
-            "base_rank": base_rank,
-            "steer_rank": steer_rank,
+            "base_rank": base_rank, "steer_rank": steer_rank,
             "target_is_top1": target_is_top1,
         }
         buffer.append(row)
         completed_this_session += 1
 
-        # Flush buffer to disk
         if len(buffer) >= args.flush_every:
             df_out = pd.DataFrame(buffer)
             header = not run_csv.exists()
@@ -490,7 +523,6 @@ def main():
             buffer.clear()
             print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
 
-        # Heartbeat
         done_tasks = len(done) + completed_this_session
         if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
             elapsed = time.time() - start_time
@@ -498,23 +530,20 @@ def main():
             eta = (total_tasks - done_tasks) / max(1e-9, rate)
             print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
 
-    # Flush remaining buffer
     if buffer:
         df_out = pd.DataFrame(buffer)
         header = not run_csv.exists()
         df_out.to_csv(run_csv, mode="a", header=header, index=False)
         print(f"[Flush] wrote {len(buffer)} rows -> {run_csv}")
 
-    # One row per (prompt_idx, feature_id, alpha): no double-write per direction
     df = pd.read_csv(run_csv)
     key_cols = ["prompt_idx", "feature_id", "alpha"]
     dupes = df.duplicated(subset=key_cols, keep="first")
     if dupes.any():
         n_dup = int(dupes.sum())
         df = df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
-        print(f"[Fix] Dropped {n_dup} duplicate (prompt_idx, feature_id, alpha) rows; {len(df)} rows remain. TASK vs CTRL must have identical row counts.")
+        print(f"[Fix] Dropped {n_dup} duplicate rows; {len(df)} rows remain.")
 
-    # Sanity gate: alpha=0 must yield ~0 deltas (steer_t - base_t at alpha=0)
     df_alpha0 = df[df["alpha"] == 0.0]
     if len(df_alpha0) > 0:
         ok = (df_alpha0["delta_logit_target"].abs() < 1e-4)
@@ -526,19 +555,12 @@ def main():
             )
         print(f"[Sanity] alpha=0: {frac_ok:.1%} of {len(df_alpha0)} rows have |delta|<1e-4")
 
-    # -----------------------------------------------------------
-    # Aggregate per feature via summarize_feature_directional
-    # -----------------------------------------------------------
     summary_rows = []
-    curve_rows = []  # for curves_per_feature.parquet
+    curve_rows = []
     for fid, df_feat in df.groupby("feature_id"):
         d = summarize_feature_directional(df_feat, T=threshold_T)
 
-        # Non-zero alphas for off-target metrics (exclude baseline alpha=0)
         df_nonzero = df_feat[df_feat["alpha"] != 0.0]
-
-        # Rank-based: at max positive alpha, what fraction of prompts
-        # have target as top-1?
         max_pos_alpha = max([a for a in alphas if a > 0], default=None)
         if max_pos_alpha is not None:
             at_max = df_feat[df_feat["alpha"] == max_pos_alpha]
@@ -546,7 +568,6 @@ def main():
         else:
             top1_rate_up = np.nan
 
-        # Mean rank improvement at max positive alpha
         if max_pos_alpha is not None and len(at_max) > 0:
             mean_rank_improve = float((at_max["base_rank"] - at_max["steer_rank"]).mean())
         else:
@@ -554,41 +575,224 @@ def main():
 
         row = {
             "feature_id": fid,
-            # Off-target metrics (non-zero alphas)
             "tv_mean": df_nonzero["tv_distance"].mean() if len(df_nonzero) > 0 else np.nan,
             "kl_mean": df_nonzero["kl_base_to_steer"].mean() if len(df_nonzero) > 0 else np.nan,
             "maxabs_mean": df_nonzero["max_abs_dlogit"].mean() if len(df_nonzero) > 0 else np.nan,
             "jacc_mean": df_nonzero["topk_jaccard"].mean() if len(df_nonzero) > 0 else np.nan,
             "target_delta_mean": df_feat["delta_logit_target"].mean(),
-            # Rank-based stricter metrics
             "top1_rate_up": top1_rate_up,
             "mean_rank_improve": mean_rank_improve,
-            # Directional success/alpha*/tv_at_crossing/monotone
             **d,
         }
         summary_rows.append(row)
 
-        # Curves per feature: (feature_id, alpha, mean_delta, std_delta, n_prompts)
         for alpha_val, grp in df_feat.groupby("alpha"):
             curve_rows.append({
-                "feature_id": fid,
-                "alpha": float(alpha_val),
+                "feature_id": fid, "alpha": float(alpha_val),
                 "mean_delta": float(grp["delta_logit_target"].mean()),
                 "std_delta": float(grp["delta_logit_target"].std()) if len(grp) > 1 else 0.0,
                 "n_prompts": int(len(grp)),
             })
+
+    _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args,
+                   sort_cols=["alpha_star_feature_up", "tv_mean"],
+                   alpha_star_cols=["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"],
+                   n_rows=len(df))
+
+
+# ===========================================================
+# Refusal mode (SALADBench: generate + keyword refusal scoring)
+# ===========================================================
+def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
+    """
+    For each (prompt, feature, alpha):
+      1. Generate a short response with steering applied at all positions.
+      2. Score the response for refusal (keyword-based).
+    alpha* = smallest |alpha| where refusal_rate drops below baseline by T.
+    """
+    device = next(model.parameters()).device
+    max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
+
+    print(f"[Refusal mode] Computing baseline generations for {len(dfp)} prompts...")
+    baseline_refusal = {}
+    for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baseline gen"):
+        text = generate_steered(model, tokenizer, prow["prompt"], max_new_tokens=max_new_tokens)
+        baseline_refusal[pi] = {
+            "prompt": prow["prompt"],
+            "base_text": text,
+            "base_refusal": _refusal_score(text),
+        }
+
+    all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
+    total_tasks = len(all_jobs)
+    run_csv = Path(args.out_dir) / "run_rows.csv"
+    start_time = time.time()
+    buffer = []
+
+    done = set()
+    if args.resume and run_csv.exists():
+        prev = pd.read_csv(run_csv, usecols=["prompt_idx", "feature_id", "alpha"])
+        done = set(map(tuple, prev.values))
+        print(f"[Resume] loaded {len(done)} completed tasks from {run_csv}")
+
+    print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
+
+    completed_this_session = 0
+    for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering (refusal)")):
+        if (pi, fid, alpha) in done:
+            continue
+
+        br = baseline_refusal[pi]
+        steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
+
+        if alpha == 0.0:
+            gen_text = br["base_text"]
+            hook_ran = True
+        else:
+            mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
+            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook)
+            hook_ran = cap["ok"]
+
+        ref_score = _refusal_score(gen_text)
+        delta_refusal = ref_score - br["base_refusal"]
+
+        row = {
+            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+            "refusal_score": ref_score,
+            "base_refusal": br["base_refusal"],
+            "delta_refusal": delta_refusal,
+            "hook_ran": bool(hook_ran),
+            "gen_text": gen_text[:500],
+        }
+        buffer.append(row)
+        completed_this_session += 1
+
+        if len(buffer) >= args.flush_every:
+            df_out = pd.DataFrame(buffer)
+            header = not run_csv.exists()
+            df_out.to_csv(run_csv, mode="a", header=header, index=False)
+            buffer.clear()
+            print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
+
+        done_tasks = len(done) + completed_this_session
+        if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
+            elapsed = time.time() - start_time
+            rate = completed_this_session / max(1e-9, elapsed)
+            eta = (total_tasks - done_tasks) / max(1e-9, rate)
+            print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+
+    if buffer:
+        df_out = pd.DataFrame(buffer)
+        header = not run_csv.exists()
+        df_out.to_csv(run_csv, mode="a", header=header, index=False)
+        print(f"[Flush] wrote {len(buffer)} rows -> {run_csv}")
+
+    df = pd.read_csv(run_csv)
+    key_cols = ["prompt_idx", "feature_id", "alpha"]
+    dupes = df.duplicated(subset=key_cols, keep="first")
+    if dupes.any():
+        n_dup = int(dupes.sum())
+        df = df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
+        print(f"[Fix] Dropped {n_dup} duplicate rows; {len(df)} rows remain.")
+
+    # Sanity: alpha=0 delta_refusal should be ~0
+    df_alpha0 = df[df["alpha"] == 0.0]
+    if len(df_alpha0) > 0:
+        ok = (df_alpha0["delta_refusal"].abs() < 1e-6)
+        frac_ok = float(ok.mean())
+        print(f"[Sanity] alpha=0: {frac_ok:.1%} of {len(df_alpha0)} rows have |delta_refusal|<1e-6")
+
+    # Aggregate per feature: alpha* is min |alpha| where mean refusal drops by >= T
+    summary_rows = []
+    curve_rows = []
+    for fid, df_feat in df.groupby("feature_id"):
+        prompts = sorted(df_feat["prompt_idx"].unique())
+        pos_alphas = sorted([a for a in alphas if a > 0])
+        neg_alphas = sorted([a for a in alphas if a < 0], key=lambda a: -a)
+
+        # Baseline refusal rate for this feature's prompts
+        base_rates = df_feat[df_feat["alpha"] == 0.0]["refusal_score"]
+        base_refusal_rate = float(base_rates.mean()) if len(base_rates) > 0 else np.nan
+
+        # alpha* up: find smallest positive alpha where mean refusal drops by >= T
+        alpha_star_up = np.nan
+        censored_up = True
+        for a in pos_alphas:
+            grp = df_feat[df_feat["alpha"] == a]
+            if len(grp) == 0:
+                continue
+            mean_ref = float(grp["refusal_score"].mean())
+            drop = base_refusal_rate - mean_ref
+            if drop >= threshold_T:
+                alpha_star_up = a
+                censored_up = False
+                break
+
+        # alpha* down: find smallest (most negative) alpha where mean refusal drops by >= T
+        alpha_star_down = np.nan
+        censored_down = True
+        for a in neg_alphas:
+            grp = df_feat[df_feat["alpha"] == a]
+            if len(grp) == 0:
+                continue
+            mean_ref = float(grp["refusal_score"].mean())
+            drop = base_refusal_rate - mean_ref
+            if drop >= threshold_T:
+                alpha_star_down = a
+                censored_down = False
+                break
+
+        # Refusal rate at max positive alpha
+        max_pos = max(pos_alphas) if pos_alphas else None
+        if max_pos is not None:
+            at_max = df_feat[df_feat["alpha"] == max_pos]
+            refusal_rate_at_max = float(at_max["refusal_score"].mean()) if len(at_max) > 0 else np.nan
+        else:
+            refusal_rate_at_max = np.nan
+
+        row = {
+            "feature_id": fid,
+            "base_refusal_rate": base_refusal_rate,
+            "refusal_rate_at_max_alpha": refusal_rate_at_max,
+            "refusal_drop_at_max_alpha": base_refusal_rate - refusal_rate_at_max if not np.isnan(refusal_rate_at_max) else np.nan,
+            "alpha_star_feature_up": alpha_star_up,
+            "alpha_star_feature_down": alpha_star_down,
+            "censored_up": censored_up,
+            "censored_down": censored_down,
+        }
+        summary_rows.append(row)
+
+        for alpha_val, grp in df_feat.groupby("alpha"):
+            curve_rows.append({
+                "feature_id": fid, "alpha": float(alpha_val),
+                "mean_refusal": float(grp["refusal_score"].mean()),
+                "std_refusal": float(grp["refusal_score"].std()) if len(grp) > 1 else 0.0,
+                "n_prompts": int(len(grp)),
+            })
+
+    _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args,
+                   sort_cols=["alpha_star_feature_up", "base_refusal_rate"],
+                   alpha_star_cols=["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"],
+                   n_rows=len(df))
+
+
+# ===========================================================
+# Shared output writer
+# ===========================================================
+def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_cols, alpha_star_cols, n_rows):
+    selected_features_path = Path(args.out_dir) / "selected_features.json"
+    run_csv = Path(args.out_dir) / "run_rows.csv"
 
     feat_summary = pd.DataFrame(summary_rows)
     alpha_ref = max(alphas, key=lambda a: abs(a))
     summary_path = os.path.join(args.out_dir, "feature_summary.csv")
     feat_summary.to_csv(summary_path, index=False)
 
-    # alpha_star.csv (official feature-level alpha* at run end)
     alpha_star_path = os.path.join(args.out_dir, "alpha_star.csv")
-    alpha_star_df = feat_summary[["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"]].copy()
+    available_cols = [c for c in alpha_star_cols if c in feat_summary.columns]
+    alpha_star_df = feat_summary[available_cols].copy()
     alpha_star_df.to_csv(alpha_star_path, index=False)
 
-    # curves_per_feature (parquet if available, else CSV)
     curves_df = pd.DataFrame(curve_rows)
     curves_path = os.path.join(args.out_dir, "curves_per_feature.parquet")
     try:
@@ -598,16 +802,19 @@ def main():
         curves_df.to_csv(curves_path, index=False)
         print(f"[Note] Wrote {curves_path} (parquet engine not found; install pyarrow for .parquet)")
 
-    # Meta (include threshold_T for reproducibility)
     meta_out = vars(args).copy()
-    meta_out["n_rows"] = int(len(df))
+    meta_out["n_rows"] = int(n_rows)
     meta_out["alpha_ref"] = alpha_ref
     meta_out["threshold_T"] = threshold_T
     with open(os.path.join(args.out_dir, "meta.json"), "w") as f:
         json.dump(meta_out, f, indent=2)
 
     print(f"\nWrote:\n- {run_csv}\n- {summary_path}\n- {alpha_star_path}\n- {curves_path}\n- {selected_features_path}\n- {os.path.join(args.out_dir, 'meta.json')}")
-    print(feat_summary.sort_values(["alpha_star_feature_up", "tv_mean"], ascending=[True, True]).head(15))
+    existing_sort = [c for c in sort_cols if c in feat_summary.columns]
+    if existing_sort:
+        print(feat_summary.sort_values(existing_sort, ascending=True).head(15))
+    else:
+        print(feat_summary.head(15))
 
 
 if __name__ == "__main__":
