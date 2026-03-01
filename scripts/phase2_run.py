@@ -588,9 +588,15 @@ def main():
     alpha_star_df = feat_summary[["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"]].copy()
     alpha_star_df.to_csv(alpha_star_path, index=False)
 
-    # curves_per_feature.parquet
+    # curves_per_feature (parquet if available, else CSV)
+    curves_df = pd.DataFrame(curve_rows)
     curves_path = os.path.join(args.out_dir, "curves_per_feature.parquet")
-    pd.DataFrame(curve_rows).to_parquet(curves_path, index=False)
+    try:
+        curves_df.to_parquet(curves_path, index=False)
+    except ImportError:
+        curves_path = os.path.join(args.out_dir, "curves_per_feature.csv")
+        curves_df.to_csv(curves_path, index=False)
+        print(f"[Note] Wrote {curves_path} (parquet engine not found; install pyarrow for .parquet)")
 
     # Meta (include threshold_T for reproducibility)
     meta_out = vars(args).copy()

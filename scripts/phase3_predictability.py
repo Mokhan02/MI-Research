@@ -48,19 +48,23 @@ def make_y_labels(summary: pd.DataFrame) -> pd.DataFrame:
         else:
             direction = "up" if (pd.isna(tv_dn) or (not pd.isna(tv_up) and float(tv_up) <= float(tv_dn))) else "down"
 
+        # phase2_run outputs alpha_star_feature_*; coerce to float for merge/merge safety
+        a_up = pd.to_numeric(row.get("alpha_star_feature_up", row.get("alpha_star_mean_up", np.nan)), errors="coerce")
+        a_dn = pd.to_numeric(row.get("alpha_star_feature_down", row.get("alpha_star_mean_down", np.nan)), errors="coerce")
         if direction == "up":
-            alpha_star_best = row.get("alpha_star_mean_up", np.nan)
+            alpha_star_best = a_up if pd.notna(a_up) else a_dn
             tv_at_alpha_star_best = row.get("tv_at_alpha_star_up", np.nan)
             success_best = row.get("success_rate_up", np.nan)
             monotone_best = row.get("monotone_frac_up", np.nan)
         else:
-            alpha_star_best = row.get("alpha_star_mean_down", np.nan)
+            alpha_star_best = a_dn if pd.notna(a_dn) else a_up
             tv_at_alpha_star_best = row.get("tv_at_alpha_star_down", np.nan)
             success_best = row.get("success_rate_down", np.nan)
             monotone_best = row.get("monotone_frac_down", np.nan)
 
+        fid = int(row["feature_id"])  # ensure int for merge with geo_df
         rows.append({
-            "feature_id": row["feature_id"],
+            "feature_id": fid,
             "alpha_star_best": alpha_star_best,
             "tv_at_alpha_star_best": tv_at_alpha_star_best,
             "success_best": success_best,
@@ -266,7 +270,8 @@ def main():
     if not summary_path.exists():
         raise FileNotFoundError(f"Need {summary_path}")
     summary = pd.read_csv(summary_path)
-    feature_ids = summary["feature_id"].astype(int).tolist()
+    summary["feature_id"] = summary["feature_id"].astype(int)  # match geo_df/y_df for merge
+    feature_ids = summary["feature_id"].tolist()
     n_feats_summary = len(feature_ids)
     print(f"Loaded feature_summary: {n_feats_summary} features")
 
