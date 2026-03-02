@@ -69,10 +69,15 @@ def forward_last_logits(model, tokenizer, prompt: str, prehook=None):
     return logits, inputs["input_ids"][0], resid_last
 
 @torch.no_grad()
-def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, prehook=None):
+def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, prehook=None, use_chat_template: bool = False):
     """Generate a short response with optional steering hook. Returns generated text (excluding prompt)."""
     device = next(model.parameters()).device
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        chat = [{"role": "user", "content": prompt}]
+        text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(text, return_tensors="pt").to(device)
+    else:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
     handle = prehook() if prehook else None
     out_ids = model.generate(
         **inputs, max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0,
@@ -616,7 +621,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     print(f"[Refusal mode] Computing baseline generations for {len(dfp)} prompts...")
     baseline_refusal = {}
     for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baseline gen"):
-        text = generate_steered(model, tokenizer, prow["prompt"], max_new_tokens=max_new_tokens)
+        text = generate_steered(model, tokenizer, prow["prompt"], max_new_tokens=max_new_tokens, use_chat_template=True)
         baseline_refusal[pi] = {
             "prompt": prow["prompt"],
             "base_text": text,
@@ -650,7 +655,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             hook_ran = True
         else:
             mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
-            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook)
+            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=True)
             hook_ran = cap["ok"]
 
         ref_score = _refusal_score(gen_text)
