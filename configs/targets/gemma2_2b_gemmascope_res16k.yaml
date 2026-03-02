@@ -5,7 +5,7 @@
 # Layer: 20 (middle layer, to be confirmed)
 
 model:
-  model_id: "google/gemma-2-2b"
+  model_id: "google/gemma-2-2b-it"
   device: "cuda"  # Use GPU for real experiments
   dtype: "bfloat16"  # Use bfloat16 for memory efficiency on A10
   max_new_tokens: 64
