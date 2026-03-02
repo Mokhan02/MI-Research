@@ -1,7 +1,9 @@
-import argparse, json
+import argparse, json, logging
 import numpy as np
 import pandas as pd
 import torch
+
+logger = logging.getLogger(__name__)
 
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -70,9 +72,14 @@ def main():
     # Per-example target vectors (single-token only)
     target_ids = []
     skipped = 0
-    for t in targets:
+    prompts = df["prompt"].astype(str).tolist() if "prompt" in df.columns else [None] * len(targets)
+    for i, t in enumerate(targets):
         tid = tok.encode(t, add_special_tokens=False)
         if len(tid) != 1:
+            logger.warning(
+                "Dropping multi-token target: target=%r n_tokens=%d prompt=%r",
+                t, len(tid), prompts[i],
+            )
             skipped += 1
             continue
         target_ids.append(tid[0])
@@ -107,4 +114,5 @@ def main():
     print(f"Wrote {args.out_csv} rows={len(out)} targets_used={len(target_ids)}/{len(targets)} skipped_multi={skipped}")
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     main()

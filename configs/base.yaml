@@ -1,8 +1,16 @@
 # Base configuration for SAE steerability experiments
 # Use device: "cpu" only for smoke tests; real runs use "cuda" (or "mps" on Apple Silicon).
+#
+# Key consumers:
+#   experiment.seed        → src/config.py (resolve_config sets run_id, output_dir)
+#   model.*                → phase2_run, phase2_select_contrast (via load_model)
+#   sae.*                  → phase2_run, phase2_select_contrast (sae_id assertion + load_gemmascope_decoder)
+#   features.*             → phase2_select_contrast (tau_act, token_span, token_span_last_n)
+#   steering.*             → phase2_run (alpha_grid, threshold_T)
+#   benchmark.prompt_csv   → phase2_run (fallback when --prompt_csv not passed)
+#   benchmark.prompt_count → phase2_run (fallback when --n_prompts not passed)
 
 experiment:
-  name: "sae-steerability"
   seed: 42
 
 model:
@@ -22,12 +30,10 @@ sae:
 
 # Feature selection: when activation_stats_path is null, stratification is off;
 # selection is pure uniform random over [0, n_features_total) using experiment.seed.
-# The run must save chosen feature IDs at start to selected_features_file for reproducibility.
 features:
   n_features: 300
   selection_mode: "uniform"  # or "contrast_delta" for task − neutral
   activation_stats_path: null
-  selected_features_file: "outputs/selected_features.json"
   # Activation definition (must be consistent). tau_act=0.0 is often too permissive; audit first.
   tau_act: 0.01
   token_span: "last_n"  # "last" with n=1 is formatting-sensitive; prefer last_n=8
@@ -38,10 +44,8 @@ steering:
   alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]  # Log-ish grid; negatives auto-added in phase2
   threshold_T: 0.10  # On-target: min delta for alpha* definition
 
-# On-target benchmark: required for reproducible alpha*.
-# Without this, you cannot reproduce which prompts or format was used.
+# On-target benchmark: prompt source for phase2_run.
+# prompt_csv and prompt_count serve as config-level defaults; CLI flags override them.
 benchmark:
-  name: null  # e.g. "SALADBench", "arithmetic_only", "xdom_facts"
   prompt_count: null  # Number of prompts used
   prompt_csv: null   # Path to prompt CSV (columns: prompt, target)
-  prompt_template: null  # Optional: description or template ID for formatting
