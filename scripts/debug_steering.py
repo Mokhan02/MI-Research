@@ -82,7 +82,7 @@ def run_once_generate(model, tokenizer, prompt, max_new_tokens=20):
 
 def main():
     cfg_path = "configs/targets/gemma2_2b_gemmascope_res16k.yaml"
-    run_id = "debug_steer_effect"
+    run_id = "debug_steering"
     config = resolve_config(load_config(cfg_path), run_id=run_id)
 
     # Force greedy / no sampling in config

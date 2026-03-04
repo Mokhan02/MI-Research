@@ -5,7 +5,7 @@ top-level safety category), and split into select / alpha / holdout CSVs.
 Also writes a neutral set from the HH-harmless subset (benign questions).
 
 Usage:
-  PYTHONPATH=. python scripts/prepare_salad_bench.py --out_dir data/prompts --n_prompts 300 --seed 42
+  PYTHONPATH=. python scripts/prepare_prompts.py --out_dir data/prompts --n_prompts 300 --seed 42
 """
 import argparse
 import random

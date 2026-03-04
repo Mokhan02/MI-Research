@@ -1,4 +1,4 @@
-# scripts/phase2_run.py
+# scripts/run_sweep.py
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -347,7 +347,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Load config first (needed for defaults and SAE assertion)
-    config = resolve_config(load_config(args.config), run_id="phase2_run")
+    config = resolve_config(load_config(args.config), run_id="run_sweep")
     sae_id = config.get("sae", {}).get("sae_id")
     if sae_id in ("TBD", "", None):
         raise ValueError(

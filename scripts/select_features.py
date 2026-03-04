@@ -115,7 +115,7 @@ def act_freq_and_mean(acts: np.ndarray, tau_act: float):
 def main():
     ap = argparse.ArgumentParser(description="Contrast-based feature selection (task − neutral)")
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
-    ap.add_argument("--domain", type=str, default="planets",
+    ap.add_argument("--domain", type=str, default="salad",
                     help="Task domain (selection uses {domain}_select.csv vs neutral_select.csv)")
     ap.add_argument("--prompts_dir", type=str, default="data/prompts")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2_select")

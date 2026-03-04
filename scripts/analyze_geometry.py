@@ -1,4 +1,4 @@
-# scripts/phase3_predictability.py
+# scripts/analyze_geometry.py
 """
 Phase 3: Predict steerability (alpha*) from pre-steering geometric features.
 
@@ -37,12 +37,12 @@ Outputs
 Usage
 -----
   # From pre-merged CSV (analysis only, no model/SAE needed):
-  python scripts/phase3_predictability.py \\
+  python scripts/analyze_geometry.py \\
       --input_csv outputs/phase3_predictability/salad_features_merged.csv \\
       --output_dir outputs/phase3_analysis
 
   # From phase-2 outputs (computes geometry from SAE decoder):
-  python scripts/phase3_predictability.py \\
+  python scripts/analyze_geometry.py \\
       --phase2_dir outputs/phase2_salad_run1 \\
       --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \\
       --output_dir outputs/phase3_analysis

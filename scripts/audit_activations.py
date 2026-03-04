@@ -7,7 +7,7 @@ to see percentiles of activations for a random subset of features, then set tau_
 to cut out near-zero fuzz (e.g. 25th or 50th percentile, or a fixed value from this run).
 
 Usage:
-  uv run python scripts/audit_activation_distribution.py --config configs/targets/gemma2_2b_gemmascope_res16k.yaml --prompt_csv data/prompts/neutral_select.csv --n_features 200 --n_prompts 100
+  uv run python scripts/audit_activations.py --config configs/targets/gemma2_2b_gemmascope_res16k.yaml --prompt_csv data/prompts/neutral_select.csv --n_features 200 --n_prompts 100
 """
 
 import argparse

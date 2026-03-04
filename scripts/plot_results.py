@@ -1,4 +1,4 @@
-# scripts/phase2_sanity_plot.py
+# scripts/plot_results.py
 """
 Sanity-check plot: for one or more features, plot:
   - Panel 1: delta_logit_target(alpha) — one thin line per prompt, mean in red
@@ -7,8 +7,8 @@ Sanity-check plot: for one or more features, plot:
 Also prints prompt-wise sign consistency (monotone fraction).
 
 Usage:
-  python scripts/phase2_sanity_plot.py --csv outputs/phase2/run_rows.csv --features 13851,541,13499
-  python scripts/phase2_sanity_plot.py --csv outputs/phase2/run_rows.csv --features 13851 --out_dir outputs/phase2/plots
+  python scripts/plot_results.py --csv outputs/phase2/run_rows.csv --features 13851,541,13499
+  python scripts/plot_results.py --csv outputs/phase2/run_rows.csv --features 13851 --out_dir outputs/phase2/plots
 """
 import argparse, os
 import numpy as np

@@ -1,17 +1,17 @@
-# scripts/phase3_predict_cv_np.py
+# scripts/predict_cv_np.py
 """
 Cross-validated predictability using only numpy + pandas (no sklearn/scipy).
 Logistic AUC for is_steerable (alpha_star <= 5/10), Ridge R2 and Spearman for tv_at_alpha_star_best.
 
 Usage:
-  python scripts/phase3_predict_cv_np.py
-  python scripts/phase3_predict_cv_np.py --csv outputs/phase3_predictability_arith/arithmetic_features_merged.csv
+  python scripts/predict_cv_np.py
+  python scripts/predict_cv_np.py --csv outputs/phase3_analysis/salad_features_merged.csv
 """
 import argparse
 import numpy as np
 import pandas as pd
 
-DEFAULT_CSV = "outputs/phase3_predictability_arith/arithmetic_features_merged.csv"
+DEFAULT_CSV = "outputs/phase3_analysis/salad_features_merged.csv"
 FEATURES = ["max_cosine_to_any", "density_tau", "mean_topk_cos", "act_freq"]
 
 

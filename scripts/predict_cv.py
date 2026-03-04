@@ -1,11 +1,11 @@
-# scripts/phase3_predict_cv.py
+# scripts/predict_cv.py
 """
 Cross-validated predictability: logistic AUC for is_steerable (alpha_star <= 5/10),
 Ridge R2 and Spearman for tv_at_alpha_star_best.
 
 Usage:
-  python scripts/phase3_predict_cv.py
-  python scripts/phase3_predict_cv.py --csv outputs/phase3_predictability_arith/arithmetic_features_merged.csv
+  python scripts/predict_cv.py
+  python scripts/predict_cv.py --csv outputs/phase3_analysis/salad_features_merged.csv
 """
 import argparse
 import numpy as np
@@ -18,7 +18,7 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import roc_auc_score, r2_score
 from scipy.stats import spearmanr
 
-DEFAULT_CSV = "outputs/phase3_predictability_arith/arithmetic_features_merged.csv"
+DEFAULT_CSV = "outputs/phase3_analysis/salad_features_merged.csv"
 
 # Pick predictors you trust (mean_act is often missing — include only if present & non-null enough)
 BASE_FEATURES = ["max_cosine_to_any", "density_tau", "mean_topk_cos", "act_freq", "mean_z_minus_thr"]
@@ -95,7 +95,7 @@ def cv_regression(df, feats, y_col, n_splits=5, seed=0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=str, default=DEFAULT_CSV, help="Merged features CSV from phase3_predictability")
+    ap.add_argument("--csv", type=str, default=DEFAULT_CSV, help="Merged features CSV from analyze_geometry")
     ap.add_argument("--n_splits", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
