@@ -9,11 +9,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+def get_best_device() -> str:
+    """Return the best available device: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def load_model(config: Dict[str, Any]):
     """Load model and tokenizer from config."""
     model_cfg = config["model"]
     model_id = model_cfg["model_id"]
-    device = model_cfg.get("device", "cpu")
+    device = model_cfg.get("device", "auto")
+    if device == "auto":
+        device = get_best_device()
     dtype_str = model_cfg.get("dtype", "float32")
     
     dtype_map = {
