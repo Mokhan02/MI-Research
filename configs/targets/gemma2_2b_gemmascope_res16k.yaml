@@ -40,7 +40,7 @@ sae_specs:
 # Feature selection for this target
 features:
   n_features: 300
-  selection_mode: "contrast_delta"  # contrast_delta | uniform
+  selection_mode: "logit_attr"  # logit_attr | contrast_delta | uniform
   activation_stats_path: null
   selected_features_file: "outputs/selected_features.json"
   # Activation definition (must be consistent across domains and runs)
@@ -51,6 +51,11 @@ features:
   # Prefer last_n=8 or 16 so you don't select "response formatting" over semantics.
   token_span: "last_n"
   token_span_last_n: 8
+  # Refusal seed tokens for logit_attr mode.  The mean unembedding of these tokens
+  # defines the "refusal direction" in output space.  Features are ranked by how
+  # much their decoder direction projects onto this, weighted by activation strength.
+  refusal_tokens: [" I", " Sorry", " cannot", " apologize", " unfortunately",
+                   " shouldn", " won", " don", " isn"]
 
 # On-target steering only
 steering:

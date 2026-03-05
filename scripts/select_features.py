@@ -1,11 +1,20 @@
 """
-Contrast-based feature selection: top K by Δ = task − neutral (not top K act_freq on task).
+Feature selection for steering experiments.
+
+Two selection modes (--selection-mode):
+  contrast_delta  : top K by Δ_freq = act_freq_task − act_freq_neutral.
+                    Finds features that *activate* more on task prompts, but
+                    these may be content detectors rather than refusal drivers.
+  logit_attr      : top K by activation-weighted logit attribution toward
+                    refusal tokens.  Ranks features by how much they *push the
+                    output distribution toward refusal* when they fire on task
+                    prompts.  Requires delta_freq > 0 as a pre-filter.
 
 Uses domain-specific *_select.csv prompts only (no overlap with alpha or holdout).
 Outputs:
-  - feature_summary_{task_domain}.csv  (act_freq_task, act_freq_neutral, delta_freq, delta_mean)
+  - feature_summary_{task_domain}.csv  (act_freq_task, act_freq_neutral, delta_freq, delta_mean, logit_attr)
   - feature_summary_neutral.csv
-  - selected_features_{task_domain}.json  (top K by delta_freq; this is the list to steer)
+  - selected_features_{task_domain}.json  (top K by chosen criterion)
   - randK_matched_actfreq.json  (random K control set)
 
 Activation rule: active = (act > tau_act) on token_span (config: tau_act, token_span).
@@ -119,7 +128,12 @@ def main():
                     help="Task domain (selection uses {domain}_select.csv vs neutral_select.csv)")
     ap.add_argument("--prompts_dir", type=str, default="data/prompts")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2_select")
-    ap.add_argument("--top-k", type=int, default=100, help="Top K by delta_freq to save as selected")
+    ap.add_argument("--selection-mode", type=str, default="logit_attr",
+                    choices=["contrast_delta", "logit_attr"],
+                    help="Ranking criterion: contrast_delta (Δ act_freq) or logit_attr (activation-weighted logit attribution toward refusal tokens)")
+    ap.add_argument("--refusal-tokens", type=str, default=None,
+                    help="Comma-separated refusal seed strings for logit_attr mode (default: config or built-in list)")
+    ap.add_argument("--top-k", type=int, default=100, help="Top K features to save as selected")
     ap.add_argument("--rand-k", type=int, default=100, help="Size of random control set")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--tau-act", type=float, default=None, help="Activation threshold (default: config features.tau_act)")
@@ -174,6 +188,42 @@ def main():
     delta_freq = act_freq_task - act_freq_neutral
     delta_mean = np.nan_to_num(mean_act_task, nan=0) - np.nan_to_num(mean_act_neutral, nan=0)
 
+    # --- Logit attribution toward refusal tokens ---
+    # For each feature j: logit_attr_j = mean_over_prompts(act_j) * (W_dec[j] @ W_unembed[refusal_tok].mean)
+    # This measures how much the feature pushes next-token logits toward refusal when it fires.
+    DEFAULT_REFUSAL_SEEDS = [" I", " Sorry", " cannot", " apologize", " unfortunately",
+                             " shouldn", " won", " don", " isn"]
+    if args.refusal_tokens:
+        refusal_seeds = [s.strip() for s in args.refusal_tokens.split(",")]
+    else:
+        refusal_seeds = config.get("features", {}).get("refusal_tokens", DEFAULT_REFUSAL_SEEDS)
+
+    refusal_tok_ids = []
+    for s in refusal_seeds:
+        # Ensure leading space for word-initial tokens
+        if not s.startswith(" "):
+            s = " " + s
+        ids = tokenizer.encode(s, add_special_tokens=False)
+        if ids:
+            refusal_tok_ids.append(ids[0])
+    refusal_tok_ids = list(set(refusal_tok_ids))
+    logger.info("Refusal seed tokens (%d unique): %s", len(refusal_tok_ids),
+                [(tid, tokenizer.decode([tid])) for tid in refusal_tok_ids[:15]])
+
+    W_unembed = model.lm_head.weight.detach().float()  # (vocab, d_model)
+    refusal_dir = W_unembed[refusal_tok_ids].mean(dim=0)  # (d_model,)
+    refusal_dir = refusal_dir / refusal_dir.norm().clamp(min=1e-12)  # unit vector
+
+    # Per-feature projection onto refusal direction in output space
+    logit_attr_per_feat = (W_dec.float() @ refusal_dir.to(W_dec.device)).cpu().numpy()  # (n_features,)
+
+    # Activation-weighted attribution: mean activation on task prompts × logit projection
+    mean_act_task_clean = np.nan_to_num(mean_act_task, nan=0.0)
+    weighted_logit_attr = mean_act_task_clean * logit_attr_per_feat  # (n_features,)
+    logger.info("Logit attr stats: proj min=%.4f max=%.4f; weighted min=%.4f max=%.4f",
+                logit_attr_per_feat.min(), logit_attr_per_feat.max(),
+                weighted_logit_attr.min(), weighted_logit_attr.max())
+
     # Feature summary for task domain
     summary_task = pd.DataFrame({
         "feature_id": np.arange(n_features_total),
@@ -183,6 +233,8 @@ def main():
         "mean_act_task": mean_act_task,
         "mean_act_neutral": mean_act_neutral,
         "delta_mean": delta_mean,
+        "logit_attr_proj": logit_attr_per_feat,
+        "weighted_logit_attr": weighted_logit_attr,
     })
     summary_task_path = out_dir / f"feature_summary_{args.domain}.csv"
     summary_task.to_csv(summary_task_path, index=False)
@@ -197,29 +249,48 @@ def main():
     summary_neutral.to_csv(summary_neutral_path, index=False)
     logger.info("Wrote %s", summary_neutral_path)
 
-    # Top K by delta_freq
+    # --- Rank and select top K ---
     top_k = min(args.top_k, n_features_total)
-    order = np.argsort(-delta_freq)
-    top_ids = order[:top_k].tolist()
+    selection_mode = args.selection_mode
+
+    if selection_mode == "logit_attr":
+        # Rank by weighted_logit_attr, but require delta_freq > 0 (must activate more on task)
+        ranking_score = weighted_logit_attr.copy()
+        ranking_score[delta_freq <= 0] = -np.inf
+        order = np.argsort(-ranking_score)
+        # Drop any that got -inf (shouldn't appear in top K unless <K candidates)
+        top_ids = [int(i) for i in order[:top_k] if np.isfinite(ranking_score[i])]
+        logger.info("Selection mode: logit_attr (weighted logit attribution, delta_freq>0 filter)")
+        logger.info("Top 5 weighted_logit_attr scores: %s",
+                     [(tid, f"{weighted_logit_attr[tid]:.4f}") for tid in top_ids[:5]])
+    else:
+        # Original: rank by delta_freq
+        order = np.argsort(-delta_freq)
+        top_ids = order[:top_k].tolist()
+        logger.info("Selection mode: contrast_delta (Δ act_freq)")
+
     payload = {
         "feature_ids": top_ids,
         "n_features": len(top_ids),
         "domain": args.domain,
-        "selection": "contrast_delta_freq",
+        "selection": selection_mode,
         "tau_act": tau_act,
         "token_span": token_span,
         "seed": args.seed,
     }
+    if selection_mode == "logit_attr":
+        payload["refusal_seeds"] = refusal_seeds
+
     selected_path = out_dir / f"selected_features_{args.domain}.json"
     with open(selected_path, "w") as f:
         json.dump(payload, f, indent=2)
-    logger.info("Wrote %s (top %d by delta_freq)", selected_path, len(top_ids))
+    logger.info("Wrote %s (top %d by %s)", selected_path, len(top_ids), selection_mode)
 
-    # Also write topK_{domain}_delta.json (same list; required for reproducibility)
-    topk_delta_path = out_dir / f"topK_{args.domain}_delta.json"
-    with open(topk_delta_path, "w") as f:
+    # Also write topK_{domain}_{mode}.json for reproducibility
+    topk_path = out_dir / f"topK_{args.domain}_{selection_mode}.json"
+    with open(topk_path, "w") as f:
         json.dump(payload, f, indent=2)
-    logger.info("Wrote %s", topk_delta_path)
+    logger.info("Wrote %s", topk_path)
 
     # Random K control (optionally matched on act_freq later; here plain random)
     rand_ids = np.random.choice(n_features_total, size=min(args.rand_k, n_features_total), replace=False).tolist()
@@ -244,7 +315,7 @@ def main():
     rand_norms = np.array([W_norms[i] for i in rand_ids])
     audit_path = out_dir / "control_audit.txt"
     with open(audit_path, "w") as f:
-        f.write("Control audit: task-selected (top K by delta_freq) vs random K\n")
+        f.write(f"Control audit: task-selected (top K by {selection_mode}) vs random K\n")
         f.write(f"  act_freq_task:  task mean={task_act_freq.mean():.4f} std={task_act_freq.std():.4f}  rand mean={rand_act_freq.mean():.4f} std={rand_act_freq.std():.4f}\n")
         f.write(f"  mean_act_task:  task mean={np.nanmean(task_mean_act):.4f}  rand mean={np.nanmean(rand_mean_act):.4f}\n")
         f.write(f"  ||W_dec||:     task mean={task_norms.mean():.4f} std={task_norms.std():.4f}  rand mean={rand_norms.mean():.4f} std={rand_norms.std():.4f}\n")
