@@ -22,20 +22,48 @@ The pipeline has five phases:
 
 ## Setup
 
-Add your API keys to `.env`:
+### Prerequisites
+
+- Python 3.10+
+- CUDA-compatible GPU (recommended)
+
+### Installation
 ```bash
-HF_TOKEN=...
-WANDB_API_KEY=...
+# Core dependencies
+pip install torch transformers accelerate
+
+# Data and analysis
+pip install pandas numpy scipy statsmodels scikit-learn pyarrow
+
+# Visualization and utilities
+pip install matplotlib tqdm pyyaml
+
+# HuggingFace tooling
+pip install --upgrade huggingface_hub
+
+# Image support
+pip install --upgrade Pillow
+
+# NumPy 2.x compatibility fix (required)
+pip install "numpy<2"
 ```
 
-Ensure `uv` is installed, then:
+If you see torchvision CUDA errors, run:
 ```bash
-uv run pipeline/run_pipeline.sh
+pip install --force-reinstall torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Already-completed phases are automatically skipped. Pass `--force` to rerun everything.
+### Credentials
 
----
+Add your HuggingFace token to the environment:
+```bash
+export HF_TOKEN=your_token_here
+```
+
+Or create a `.env` file:
+```
+HF_TOKEN=your_token_here
+```
 
 ## Experimental Pipeline
 
@@ -221,4 +249,5 @@ outputs/
 Girish, Akshaj, Mo, Aashna, Shlok
 
 Research doc: https://docs.google.com/document/d/1c-gnQnJlBCQvK3M607sx0QAn8XebIgnVtDrnkB0pQQ0/edit?tab=t.itpz4hcr2hqi#heading=h.4uarl9d0uyvr
+
 
