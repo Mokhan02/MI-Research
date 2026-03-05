@@ -7,6 +7,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.config import load_config, resolve_config
+from src.model_utils import get_best_device
 
 def load_feature_ids(path: str):
     if path.endswith(".json"):
@@ -49,7 +50,9 @@ def main():
 
     config = resolve_config(load_config(args.config), run_id="alignment_per_example")
     model_id = config["model"]["model_id"]
-    device = args.device or config["model"].get("device", "cuda")
+    device = args.device or config["model"].get("device") or get_best_device()
+    if device == "auto":
+        device = get_best_device()
     dtype = config["model"].get("dtype", "bfloat16")
     torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(dtype, torch.bfloat16)
 

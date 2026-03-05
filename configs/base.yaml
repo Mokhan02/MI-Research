@@ -1,5 +1,6 @@
 # Base configuration for SAE steerability experiments
-# Use device: "cpu" only for smoke tests; real runs use "cuda" (or "mps" on Apple Silicon).
+# device: "auto" picks cuda > mps > cpu at runtime.
+# Override to "cpu" for smoke tests only.
 
 experiment:
   name: "sae-steerability"
@@ -7,7 +8,7 @@ experiment:
 
 model:
   model_id: "gpt2"  # Override in target configs
-  device: "cuda"    # Use "cpu" only for smoke tests
+  device: "auto"    # auto: cuda > mps > cpu
   dtype: "float32"
   max_new_tokens: 64
   temperature: 0.0

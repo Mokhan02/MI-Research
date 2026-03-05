@@ -6,8 +6,8 @@
 
 model:
   model_id: "google/gemma-2-2b-it"
-  device: "cuda"  # Use GPU for real experiments
-  dtype: "bfloat16"  # Use bfloat16 for memory efficiency on A10
+  device: "auto"   # auto: cuda > mps > cpu
+  dtype: "bfloat16"  # bfloat16 works on MPS (PyTorch >=2.4); use float16 if you hit issues
   max_new_tokens: 64
   temperature: 0.0
   do_sample: false
