@@ -117,7 +117,7 @@ def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir:
     return _mk, ran
 
 def encode_target(tokenizer, t):
-    if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t.strip() == ""):
+    if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t == ""):
         return None
 
     # If it's numeric, force string
@@ -334,14 +334,15 @@ def main():
     ap.add_argument("--flush_every", type=int, default=2000)
     ap.add_argument("--resume", action="store_true", help="Skip tasks already in run_rows.csv")
     ap.add_argument("--micro_sweep", action="store_true",
-                    help="Micro sweep: 10 features, 25 prompts, alpha=[0,.5,1,2,5]. Run this before full K=100.")
+                    help="Micro sweep: 10 features, 25 prompts, default alpha=[-40..40]. --alphas overrides the grid.")
     args = ap.parse_args()
 
     if args.micro_sweep:
         args.n_features = 10
         args.n_prompts = 25
-        args.alphas = "0,0.5,1,2,5"
-        print("[Micro sweep] n_features=10, n_prompts=25, alphas=[0,.5,1,2,5]")
+        if args.alphas is None:
+            args.alphas = "-40,-20,-10,-5,-2,-1,0,1,2,5,10,20,40"
+        print(f"[Micro sweep] n_features=10, n_prompts=25, alphas={args.alphas}")
 
     set_determinism(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -381,7 +382,7 @@ def main():
     if args.mode == "logit":
         if "target" not in dfp.columns:
             dfp["target"] = np.nan
-        dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str).str.strip() != "")
+        dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str) != "")
         dfp = dfp[dfp["_has_target"]].drop(columns=["_has_target"]).reset_index(drop=True)
         if len(dfp) == 0:
             raise ValueError("No prompts with explicit target in prompt_csv. Logit mode requires a non-null target per prompt.")
