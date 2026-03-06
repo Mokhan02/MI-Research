@@ -5,7 +5,7 @@
 # Layer: 20 (middle layer, to be confirmed)
 
 model:
-  model_id: "google/gemma-2-2b"
+  model_id: "google/gemma-2-2b-it"
   device: "cuda"  # Use GPU for real experiments
   dtype: "bfloat16"  # Use bfloat16 for memory efficiency on A10
   max_new_tokens: 64
@@ -46,7 +46,7 @@ features:
   # Activation definition (must be consistent across domains and runs)
   # tau_act: 0.0 is usually too permissive (act_freq = fraction act>0 is noisy). Run
   #   scripts/audit_activation_distribution.py and set tau_act from percentiles or pilot.
-  tau_act: 0.01
+  tau_act: 2.0
   # token_span "last" with last_n=1 is sensitive to formatting (trailing punct, "Answer:").
   # Prefer last_n=8 or 16 so you don't select "response formatting" over semantics.
   token_span: "last_n"
@@ -61,10 +61,14 @@ steering:
 
 # On-target benchmark (required for reproducible alpha*)
 benchmark:
-  name: "planets_clean"  # or SALADBench / xdom_facts / etc.
-  prompt_count: 500        # Override per run via --n_prompts if needed
-  prompt_csv: "data/prompts/phase2_planets_clean.csv"
-  prompt_template: "prompt + target columns; target optional, fallback top-1"
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+# Generation settings (used in --mode refusal)
+generation:
+  max_new_tokens: 64
 
 # Experiment metadata
 experiment:
