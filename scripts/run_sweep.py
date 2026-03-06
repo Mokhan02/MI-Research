@@ -117,7 +117,7 @@ def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir:
     return _mk, ran
 
 def encode_target(tokenizer, t):
-    if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t == ""):
+    if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t.strip() == ""):
         return None
 
     # If it's numeric, force string
@@ -382,7 +382,7 @@ def main():
     if args.mode == "logit":
         if "target" not in dfp.columns:
             dfp["target"] = np.nan
-        dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str) != "")
+        dfp["_has_target"] = dfp["target"].notna() & (dfp["target"].astype(str).str.strip() != "")
         dfp = dfp[dfp["_has_target"]].drop(columns=["_has_target"]).reset_index(drop=True)
         if len(dfp) == 0:
             raise ValueError("No prompts with explicit target in prompt_csv. Logit mode requires a non-null target per prompt.")
