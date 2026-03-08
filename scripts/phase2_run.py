@@ -319,7 +319,8 @@ def main():
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
     ap.add_argument("--prompt_csv", type=str, default=None, help="Override benchmark.prompt_csv from config")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2")
-    ap.add_argument("--layer", type=int, default=20)
+    ap.add_argument("--layer", type=int, default=None,
+                    help="Layer index for steering hook. If not set, reads from config sae.layer_idx.")
     ap.add_argument("--n_prompts", type=int, default=None, help="Override benchmark.prompt_count from config")
     ap.add_argument("--n_features", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1234)
@@ -388,6 +389,12 @@ def main():
     dfp = dfp.head(n_prompts).reset_index(drop=True)
     if len(dfp) == 0:
         raise ValueError("No usable prompts in prompt_csv.")
+    if args.layer is None:
+        args.layer = config.get("sae", {}).get("layer_idx")
+        if args.layer is None:
+            raise ValueError("Either pass --layer or set sae.layer_idx in config")
+    print(f"[Config] Steering layer: {args.layer}")
+
     config["model"]["do_sample"] = False
     config["model"]["temperature"] = 0.0
     model, tokenizer = load_model(config)

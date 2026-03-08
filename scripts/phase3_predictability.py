@@ -822,9 +822,18 @@ def main():
         # Load SAE
         config = resolve_config(load_config(args.config), run_id="phase3")
         _, meta = load_gemmascope_decoder(config)
-        npz_path = meta["npz_path"]
-        data = np.load(npz_path)
-        W_dec = np.asarray(data["W_dec"], dtype=np.float32)
+        weights_path = meta["npz_path"]
+        chosen_key = meta.get("chosen_key", "W_dec")
+        was_transposed = meta.get("transposed", False)
+        if meta.get("weights_format") == "safetensors":
+            from safetensors.torch import load_file
+            st = load_file(weights_path)
+            W_dec = st[chosen_key].float().numpy()
+        else:
+            data = np.load(weights_path)
+            W_dec = np.asarray(data[chosen_key], dtype=np.float32)
+        if was_transposed:
+            W_dec = W_dec.T
         n_feats_total, d_model = W_dec.shape
         logger.info("W_dec: %d x %d", n_feats_total, d_model)
 

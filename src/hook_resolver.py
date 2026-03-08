@@ -54,14 +54,14 @@ def resolve_hook_point(model: torch.nn.Module, hook_name: str) -> torch.nn.Modul
         logger.info(f"Resolved hook point (exact match): '{hook_name}'")
         return named_modules[hook_name]
 
-    # TransformerLens: blocks.{L}.hook_resid_post -> model.layers.{L}
+    # TransformerLens: blocks.{L}.hook_resid_post -> model.layers.{L} or model.model.layers.{L}
     layer_idx, kind = parse_tl_blocks_hook(hook_name)
     if layer_idx is not None and kind is not None:
         if "hook_resid_post" in kind or kind == "hook_resid_post":
-            hf_name = f"model.layers.{layer_idx}"
-            if hf_name in named_modules:
-                logger.info(f"Resolved hook point (TL -> HF): '{hook_name}' -> '{hf_name}'")
-                return named_modules[hf_name]
+            for hf_name in (f"model.layers.{layer_idx}", f"model.model.layers.{layer_idx}"):
+                if hf_name in named_modules:
+                    logger.info(f"Resolved hook point (TL -> HF): '{hook_name}' -> '{hf_name}'")
+                    return named_modules[hf_name]
             # Try without "model." prefix (some architectures)
             alt = f"layers.{layer_idx}"
             for name, mod in named_modules.items():

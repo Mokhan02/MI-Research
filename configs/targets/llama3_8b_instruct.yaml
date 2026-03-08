@@ -1,0 +1,61 @@
+# Llama 3.1 8B Instruct + Llama Scope SAE (OpenMOSS L16R-8x)
+#
+# Model: meta-llama/Llama-3.1-8B-Instruct
+# SAE: OpenMOSS-Team/Llama3_1-8B-Base-LXR-8x (layer 16, 8x expansion = 32k features)
+# Layer: 16 (middle)
+
+model:
+  model_id: "meta-llama/Llama-3.1-8B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "llamascope"
+  sae_set: "Llama3_1-8B-Base-L16R-8x"
+  sae_id: "16-llamascope-32k"
+  layer_idx: 16
+  hook_point: "blocks.16.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "OpenMOSS-Team/Llama3_1-8B-Base-LXR-8x"
+  weights_path: "Llama3_1-8B-Base-L16R-8x/checkpoints/final.safetensors"
+  n_features_total: 32768
+
+architecture:
+  d_model: 4096
+  n_layers: 32
+  vocab_size: 128256
+
+sae_specs:
+  decoder_shape: [32768, 4096]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features_llama.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+steering:
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "llama3-8b-instruct-llamascope-layer16"
+  seed: 42
+  phase: 1
