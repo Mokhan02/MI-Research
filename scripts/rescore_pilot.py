@@ -1,5 +1,5 @@
 """Re-score existing run_rows.csv with updated refusal scorer. No GPU needed."""
-import sys
+import sys, argparse
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -7,7 +7,13 @@ import pandas as pd
 import numpy as np
 from src.refusal_scorer import refusal_score
 
-run_csv = "outputs/phase2_salad_pilot/run_rows.csv"
+parser = argparse.ArgumentParser()
+parser.add_argument("--run_dir", type=str, default="outputs/phase2_salad_pilot",
+                    help="Directory containing run_rows.csv to rescore")
+args = parser.parse_args()
+
+run_dir = Path(args.run_dir)
+run_csv = str(run_dir / "run_rows.csv")
 df = pd.read_csv(run_csv)
 
 df["refusal_score_new"] = df["gen_text"].fillna("").apply(refusal_score)
@@ -79,10 +85,10 @@ if new_rate > old_rate:
         })
 
     feat_summary = pd.DataFrame(summary_rows)
-    feat_summary.to_csv("outputs/phase2_salad_pilot/feature_summary.csv", index=False)
+    feat_summary.to_csv(str(run_dir / "feature_summary.csv"), index=False)
 
     alpha_star_df = feat_summary[["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"]]
-    alpha_star_df.to_csv("outputs/phase2_salad_pilot/alpha_star.csv", index=False)
+    alpha_star_df.to_csv(str(run_dir / "alpha_star.csv"), index=False)
 
     n_uncensored = int((~feat_summary["censored_up"]).sum())
     print(f"\nRe-aggregated feature_summary.csv and alpha_star.csv")
