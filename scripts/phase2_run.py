@@ -618,10 +618,11 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     device = next(model.parameters()).device
     max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
 
-    print(f"[Refusal mode] Computing baseline generations for {len(dfp)} prompts...")
+    use_chat = config.get("model", {}).get("use_chat_template", True)
+    print(f"[Refusal mode] use_chat_template={use_chat}, computing baseline generations for {len(dfp)} prompts...")
     baseline_refusal = {}
     for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baseline gen"):
-        text = generate_steered(model, tokenizer, prow["prompt"], max_new_tokens=max_new_tokens, use_chat_template=True)
+        text = generate_steered(model, tokenizer, prow["prompt"], max_new_tokens=max_new_tokens, use_chat_template=use_chat)
         baseline_refusal[pi] = {
             "prompt": prow["prompt"],
             "base_text": text,
@@ -655,7 +656,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             hook_ran = True
         else:
             mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
-            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=True)
+            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat)
             hook_ran = cap["ok"]
 
         ref_score = _refusal_score(gen_text)
