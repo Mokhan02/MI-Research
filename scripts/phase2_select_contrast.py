@@ -3,12 +3,23 @@ Contrast-based feature selection: top K by Δ = task − neutral (not top K act_
 
 Uses domain-specific *_select.csv prompts only (no overlap with alpha or holdout).
 Outputs:
-  - feature_summary_{task_domain}.csv  (act_freq_task, act_freq_neutral, delta_freq, delta_mean)
+  - feature_summary_{task_domain}.csv  (act_freq, delta_freq, delta_mean, composite_score, strategy)
   - feature_summary_neutral.csv
-  - selected_features_{task_domain}.json  (top K by delta_freq; this is the list to steer)
+  - selected_features_{task_domain}.json  (top K by composite_score or delta_freq)
   - randK_matched_actfreq.json  (random K control set)
 
 Activation rule: active = (act > tau_act) on token_span (config: tau_act, token_span).
+
+Scoring modes (--scoring):
+  delta_freq:  Legacy: rank by delta_freq = act_freq_task - act_freq_neutral.
+  composite:   Bhargav & Zhu (arXiv 2511.00029) composite score:
+               score_f = w1 * (|norm_diff_mean_f| / max) + w2 * (1 - norm_variance_f)
+               with thresholds on score, |norm_diff_mean|, and variance.
+               Also writes strategy (suppress / amplify) from sign of diff_mean.
+
+Pooling modes (--pooling):
+  mean:  Mean over token span (default, legacy).
+  max:   Max over token span (CorrSteer recommendation).
 """
 
 import argparse
@@ -47,8 +58,14 @@ def load_prompts_from_csv(path: Path) -> list[str]:
 def get_feature_acts(
     model, tokenizer, hook_module, W_dec, prompts: list[str],
     batch_size: int, device, token_span: str = "last", last_n: int = 1,
+    pooling: str = "mean",
 ) -> np.ndarray:
-    """Return (n_prompts, n_features) raw pre-threshold activations (resid @ W_dec.T at hook)."""
+    """Return (n_prompts, n_features) raw pre-threshold activations (resid @ W_dec.T at hook).
+
+    pooling: how to aggregate across tokens in the span.
+      "mean" — average residual over the span, then project (legacy).
+      "max"  — project each token separately, then take max activation per feature (CorrSteer).
+    """
     captured = []
 
     def hook_fn(module, input, output):
@@ -77,22 +94,32 @@ def get_feature_acts(
                     raise RuntimeError("Hook did not capture")
                 resid = captured[0]  # (batch, seq, d_model)
                 attn = inputs.get("attention_mask")
-                if attn is not None:
-                    last_idx = (attn.sum(dim=1) - 1).clamp(min=0)
-                    batch_dim = torch.arange(resid.shape[0], device=resid.device)
-                    if token_span == "last":
-                        pos = resid[batch_dim, last_idx, :]
-                    elif token_span == "last_n":
-                        start = (last_idx - last_n + 1).clamp(min=0)
-                        pos = torch.stack([
-                            resid[b, start[b]:last_idx[b] + 1, :].mean(dim=0) for b in range(resid.shape[0])
-                        ])
-                    else:
-                        pos = resid.mean(dim=1)
+
+                if pooling == "max":
+                    resid_f = resid.float()
+                    all_acts = resid_f @ W_dec.T  # (batch, seq, n_features)
+                    if attn is not None:
+                        mask = attn.unsqueeze(-1).float()
+                        all_acts = all_acts * mask + (-1e9) * (1 - mask)
+                    acts = all_acts.max(dim=1).values  # (batch, n_features)
                 else:
-                    pos = resid[:, -last_n:, :].mean(dim=1) if token_span == "last_n" else resid[:, -1, :]
-                pos = pos.float()
-                acts = pos @ W_dec.T
+                    if attn is not None:
+                        last_idx = (attn.sum(dim=1) - 1).clamp(min=0)
+                        batch_dim = torch.arange(resid.shape[0], device=resid.device)
+                        if token_span == "last":
+                            pos = resid[batch_dim, last_idx, :]
+                        elif token_span == "last_n":
+                            start = (last_idx - last_n + 1).clamp(min=0)
+                            pos = torch.stack([
+                                resid[b, start[b]:last_idx[b] + 1, :].mean(dim=0) for b in range(resid.shape[0])
+                            ])
+                        else:
+                            pos = resid.mean(dim=1)
+                    else:
+                        pos = resid[:, -last_n:, :].mean(dim=1) if token_span == "last_n" else resid[:, -1, :]
+                    pos = pos.float()
+                    acts = pos @ W_dec.T
+
                 acts_list.append(acts.cpu().numpy())
         return np.concatenate(acts_list, axis=0)
     finally:
@@ -112,6 +139,49 @@ def act_freq_and_mean(acts: np.ndarray, tau_act: float):
     return act_freq, mean_act
 
 
+def composite_score(
+    task_acts: np.ndarray,
+    neutral_acts: np.ndarray,
+    tau_act: float,
+    w1: float = 0.5,
+    w2: float = 0.5,
+    min_score: float = 0.0,
+    min_diff_mean: float = 0.0,
+    max_variance: float = float("inf"),
+):
+    """Bhargav & Zhu-style composite feature scoring.
+
+    Returns (scores, strategies, diff_mean, variance) arrays of shape (n_features,).
+    strategy[f] ∈ {"amplify", "suppress"} from sign of diff_mean.
+    """
+    n_features = task_acts.shape[1]
+    active_task = task_acts > tau_act
+    active_neutral = neutral_acts > tau_act
+
+    mean_task = np.nanmean(np.where(active_task, task_acts, np.nan), axis=0)
+    mean_neutral = np.nanmean(np.where(active_neutral, neutral_acts, np.nan), axis=0)
+    mean_task = np.nan_to_num(mean_task, nan=0.0)
+    mean_neutral = np.nan_to_num(mean_neutral, nan=0.0)
+
+    diff_mean = mean_task - mean_neutral
+    abs_diff = np.abs(diff_mean)
+    max_abs = abs_diff.max() if abs_diff.max() > 0 else 1.0
+    norm_diff = abs_diff / max_abs
+
+    variance = np.nanvar(np.where(active_task, task_acts, np.nan), axis=0)
+    variance = np.nan_to_num(variance, nan=0.0)
+    max_var = variance.max() if variance.max() > 0 else 1.0
+    norm_var = variance / max_var
+
+    scores = w1 * norm_diff + w2 * (1.0 - norm_var)
+
+    mask = (scores >= min_score) & (abs_diff >= min_diff_mean) & (variance <= max_variance)
+    scores = np.where(mask, scores, 0.0)
+
+    strategies = np.where(diff_mean >= 0, "amplify", "suppress")
+    return scores, strategies, diff_mean, variance
+
+
 def main():
     ap = argparse.ArgumentParser(description="Contrast-based feature selection (task − neutral)")
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
@@ -119,11 +189,20 @@ def main():
                     help="Task domain (selection uses {domain}_select.csv vs neutral_select.csv)")
     ap.add_argument("--prompts_dir", type=str, default="data/prompts")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2_select")
-    ap.add_argument("--top-k", type=int, default=100, help="Top K by delta_freq to save as selected")
+    ap.add_argument("--top-k", type=int, default=100, help="Top K by composite_score or delta_freq")
     ap.add_argument("--rand-k", type=int, default=100, help="Size of random control set")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--tau-act", type=float, default=None, help="Activation threshold (default: config features.tau_act)")
     ap.add_argument("--token-span", type=str, default=None, choices=["last", "last_n", "all"])
+    ap.add_argument("--scoring", type=str, default="composite", choices=["delta_freq", "composite"],
+                    help="Scoring strategy: delta_freq (legacy) or composite (Bhargav & Zhu)")
+    ap.add_argument("--pooling", type=str, default="mean", choices=["mean", "max"],
+                    help="Token-level pooling: mean (legacy) or max (CorrSteer)")
+    ap.add_argument("--comp-w1", type=float, default=0.5, help="Composite weight on |norm_diff_mean|")
+    ap.add_argument("--comp-w2", type=float, default=0.5, help="Composite weight on (1 - norm_variance)")
+    ap.add_argument("--comp-min-score", type=float, default=0.0, help="Min composite score threshold")
+    ap.add_argument("--comp-min-diff", type=float, default=0.0, help="Min |diff_mean| threshold")
+    ap.add_argument("--comp-max-var", type=float, default=float("inf"), help="Max variance threshold")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -160,19 +239,37 @@ def main():
     W_dec = decoder.to(device=device, dtype=torch.float32)
     assert W_dec.shape == (n_features_total, d_model), f"W_dec {W_dec.shape}"
 
+    logger.info("Pooling mode: %s", args.pooling)
     task_acts = get_feature_acts(
         model, tokenizer, hook_module, W_dec, task_select,
         args.batch_size, device, token_span=token_span, last_n=last_n,
+        pooling=args.pooling,
     )
     neutral_acts = get_feature_acts(
         model, tokenizer, hook_module, W_dec, neutral_select,
         args.batch_size, device, token_span=token_span, last_n=last_n,
+        pooling=args.pooling,
     )
 
     act_freq_task, mean_act_task = act_freq_and_mean(task_acts, tau_act)
     act_freq_neutral, mean_act_neutral = act_freq_and_mean(neutral_acts, tau_act)
     delta_freq = act_freq_task - act_freq_neutral
     delta_mean = np.nan_to_num(mean_act_task, nan=0) - np.nan_to_num(mean_act_neutral, nan=0)
+
+    # --- Composite scoring (Bhargav & Zhu) ---
+    if args.scoring == "composite":
+        comp_scores, strategies, diff_mean_raw, variance_raw = composite_score(
+            task_acts, neutral_acts, tau_act,
+            w1=args.comp_w1, w2=args.comp_w2,
+            min_score=args.comp_min_score,
+            min_diff_mean=args.comp_min_diff,
+            max_variance=args.comp_max_var,
+        )
+    else:
+        comp_scores = np.zeros(n_features_total)
+        strategies = np.full(n_features_total, "n/a")
+        diff_mean_raw = delta_mean
+        variance_raw = np.zeros(n_features_total)
 
     # Feature summary for task domain
     summary_task = pd.DataFrame({
@@ -183,6 +280,10 @@ def main():
         "mean_act_task": mean_act_task,
         "mean_act_neutral": mean_act_neutral,
         "delta_mean": delta_mean,
+        "composite_score": comp_scores,
+        "strategy": strategies,
+        "diff_mean_raw": diff_mean_raw,
+        "variance": variance_raw,
     })
     summary_task_path = out_dir / f"feature_summary_{args.domain}.csv"
     summary_task.to_csv(summary_task_path, index=False)
@@ -197,15 +298,27 @@ def main():
     summary_neutral.to_csv(summary_neutral_path, index=False)
     logger.info("Wrote %s", summary_neutral_path)
 
-    # Top K by delta_freq
+    # Top K by the selected scoring strategy
     top_k = min(args.top_k, n_features_total)
-    order = np.argsort(-delta_freq)
+    if args.scoring == "composite":
+        rank_metric = comp_scores
+        selection_label = "contrast_composite"
+    else:
+        rank_metric = delta_freq
+        selection_label = "contrast_delta_freq"
+
+    order = np.argsort(-rank_metric)
     top_ids = order[:top_k].tolist()
+    top_strategies = [strategies[i] for i in top_ids]
+
     payload = {
         "feature_ids": top_ids,
+        "strategies": top_strategies,
         "n_features": len(top_ids),
         "domain": args.domain,
-        "selection": "contrast_delta_freq",
+        "selection": selection_label,
+        "scoring": args.scoring,
+        "pooling": args.pooling,
         "tau_act": tau_act,
         "token_span": token_span,
         "seed": args.seed,
@@ -213,10 +326,9 @@ def main():
     selected_path = out_dir / f"selected_features_{args.domain}.json"
     with open(selected_path, "w") as f:
         json.dump(payload, f, indent=2)
-    logger.info("Wrote %s (top %d by delta_freq)", selected_path, len(top_ids))
+    logger.info("Wrote %s (top %d by %s)", selected_path, len(top_ids), selection_label)
 
-    # Also write topK_{domain}_delta.json (same list; required for reproducibility)
-    topk_delta_path = out_dir / f"topK_{args.domain}_delta.json"
+    topk_delta_path = out_dir / f"topK_{args.domain}_{args.scoring}.json"
     with open(topk_delta_path, "w") as f:
         json.dump(payload, f, indent=2)
     logger.info("Wrote %s", topk_delta_path)

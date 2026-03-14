@@ -2,6 +2,8 @@
 
 This note explains how Arad et al. (“SAEs Are Good for Steering – If You Select the Right Features” [`arxiv.org/pdf/2505.20063`](https://arxiv.org/pdf/2505.20063)) implement SAE-based steering on Gemma-2, how that differs from the current `phase2_run.py` setup, and what concrete changes are needed to match their setup more closely.
 
+**For a single list of all changes with the paper/source and rationale for each, see [docs/steering_changes_and_papers.md](docs/steering_changes_and_papers.md).**
+
 ---
 
 ## 1. Steering in Arad et al.
@@ -232,15 +234,171 @@ This should make SAE-based steering more comparable, in both methodology and exp
 
 ---
 
-## 6. Summary
+## 6. Implementation status
+
+All Tier 1 changes from the alignment plan have been implemented:
+
+### 6.1 Activation-scaled steering (implemented)
+
+`phase2_run.py` now defaults to Arad-style activation-scaled steering:
+
+- `src/sae_loader.py` has `load_gemmascope_full()` which loads `W_enc`, `b_enc`, and `threshold` from the GemmaScope NPZ alongside `W_dec`.
+- New hooks in `phase2_run.py`:
+  - `make_steer_prehook_amax` — single-position steering (logit mode).
+  - `make_steer_prehook_amax_lastpos` — last-token-only steering (refusal/generation mode, matching Arad's `AmlifySAEHook`).
+- Both compute `a_max = max(relu(resid @ W_enc + b_enc - threshold))` from the live hidden state.
+- The `alpha` parameter is now the steering factor \(s\); effective perturbation is \(\alpha \cdot a_{\max} \cdot W_{\text{dec}}^{(i)}\).
+- Pass `--legacy_steering` to revert to the old fixed-vector mode for comparison.
+
+### 6.2 Output-score feature selection (implemented)
+
+`scripts/compute_output_scores.py` computes Arad et al. output scores:
+
+- Projects `W_dec[fid]` through final layer norm + lm_head → top-20 logit-lens tokens.
+- One forward pass per feature on a neutral prompt with activation-scaled steering at `amp_factor=10`.
+- Score = `(1 - min_rank/vocab_size) * max_prob(logit_lens_tokens)`.
+- `--filtered_out` writes a `selected_features_*.json` with only features above the threshold.
+
+### 6.3 Full pipeline
+
+```bash
+# 1. Contrast-based candidate pool
+uv run python scripts/phase2_select_contrast.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --domain salad --out_dir outputs/phase2_select_salad --top-k 100
+
+# 2. Output-score filter (Arad et al.)
+uv run python scripts/compute_output_scores.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --features_path outputs/phase2_select_salad/selected_features_salad.json \
+  --out_path outputs/phase2_select_salad/output_scores.json \
+  --filtered_out outputs/phase2_select_salad/selected_features_salad_filtered.json \
+  --threshold 0.01
+
+# 3. Steering run with filtered features (activation-scaled by default)
+uv run python scripts/phase2_run.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --mode refusal \
+  --out_dir outputs/phase2_salad_arad \
+  --n_prompts 99 \
+  --alphas 0,1,2,5,10,20,40 \
+  --fixed_features_path outputs/phase2_select_salad/selected_features_salad_filtered.json
+```
+
+### 6.4 Composite scoring — Bhargav & Zhu (implemented)
+
+`scripts/phase2_select_contrast.py` now supports `--scoring composite` (default):
+
+- Computes a dual-component score per feature:
+
+  \[
+  \text{score}_f = w_1 \cdot \frac{|\Delta\bar{a}_f|}{\max |\Delta\bar{a}|} + w_2 \cdot (1 - \hat{\sigma}^2_f)
+  \]
+
+  where \(\Delta\bar{a}_f\) = mean activation difference (task − neutral) and \(\hat{\sigma}^2_f\) = normalized variance of task activations.
+
+- Thresholds: `--comp-min-score`, `--comp-min-diff`, `--comp-max-var`.
+- Weights: `--comp-w1` (default 0.5) and `--comp-w2` (default 0.5).
+- Outputs per-feature `strategy` (amplify / suppress) from the sign of the differential.
+- Pass `--scoring delta_freq` to revert to legacy ranking by \(\Delta\text{freq}\).
+
+### 6.5 Max-pooling for activations (implemented)
+
+`scripts/phase2_select_contrast.py` now supports `--pooling max`:
+
+- Projects every token's residual through \(W_{\text{dec}}^T\) to get per-token feature activations.
+- Takes `max` over all non-padding tokens per feature (instead of mean-pooling the residuals first).
+- Recommended by CorrSteer literature: max-pool captures the strongest activation instance, avoiding dilution from inactive positions.
+- Pass `--pooling mean` (default) to keep the legacy mean-pool behavior.
+
+### 6.6 Multi-feature steering (implemented)
+
+`scripts/phase2_run.py` now supports `--multi_steer_top_n N`:
+
+- Takes the first N features from `--fixed_features_path` (assumed ordered by score, top first).
+- Sums their decoder directions into a single combined steering vector.
+- Sweeps over the alpha grid with this combined direction instead of iterating per feature.
+- New hooks: `make_steer_prehook_multi_amax` (logit) and `make_steer_prehook_multi_amax_lastpos` (refusal).
+- Writes results to `run_rows_multi.csv` and `curves_multi_topN.csv`.
+- Usage:
+
+  ```bash
+  uv run python scripts/phase2_run.py \
+    --mode refusal \
+    --fixed_features_path outputs/phase2_select_salad/selected_features_salad_filtered.json \
+    --multi_steer_top_n 5 \
+    --out_dir outputs/phase2_salad_multi5
+  ```
+
+### 6.7 Config variants for wider SAE / later layers (implemented)
+
+Three new config files for ablation studies. The `weights_path` (average_l0_*) values have been verified against [google/gemma-scope-2b-pt-res](https://huggingface.co/google/gemma-scope-2b-pt-res) on HuggingFace:
+
+| Config | Layer | Width | weights_path (verified) |
+|--------|-------|-------|-------------------------|
+| `gemma2_2b_gemmascope_res65k.yaml` | 20 | 65K | `layer_20/width_65k/average_l0_61/params.npz` |
+| `gemma2_2b_gemmascope_layer22.yaml` | 22 | 16K | `layer_22/width_16k/average_l0_72/params.npz` |
+| `gemma2_2b_gemmascope_layer24.yaml` | 24 | 16K | `layer_24/width_16k/average_l0_73/params.npz` |
+
+Other `average_l0_*` options exist per layer/width on the repo if you want sparser/denser SAEs.
+
+---
+
+## 7. Full pipeline (updated)
+
+```bash
+# 1. Contrast-based candidate pool (composite scoring + max-pool)
+uv run python scripts/phase2_select_contrast.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --domain salad --out_dir outputs/phase2_select_salad --top-k 100 \
+  --scoring composite --pooling max
+
+# 2. Output-score filter (Arad et al.)
+uv run python scripts/compute_output_scores.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --features_path outputs/phase2_select_salad/selected_features_salad.json \
+  --out_path outputs/phase2_select_salad/output_scores.json \
+  --filtered_out outputs/phase2_select_salad/selected_features_salad_filtered.json \
+  --threshold 0.01
+
+# 3. Single-feature steering run (activation-scaled by default)
+uv run python scripts/phase2_run.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --mode refusal \
+  --out_dir outputs/phase2_salad_arad \
+  --n_prompts 99 \
+  --alphas 0,1,2,5,10,20,40 \
+  --fixed_features_path outputs/phase2_select_salad/selected_features_salad_filtered.json
+
+# 4. Multi-feature steering (optional: top 5 features combined)
+uv run python scripts/phase2_run.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --mode refusal \
+  --out_dir outputs/phase2_salad_multi5 \
+  --n_prompts 99 \
+  --alphas 0,1,2,5,10,20,40 \
+  --fixed_features_path outputs/phase2_select_salad/selected_features_salad_filtered.json \
+  --multi_steer_top_n 5
+
+# 5. Layer ablation (repeat steps 1-3 with different configs)
+uv run python scripts/phase2_select_contrast.py \
+  --config configs/targets/gemma2_2b_gemmascope_layer22.yaml \
+  --domain salad --out_dir outputs/phase2_select_salad_l22 --top-k 100 \
+  --scoring composite --pooling max
+# ... then output scores + steering run with layer22 config
+```
+
+---
+
+## 8. Summary
 
 - **Arad et al.** steer by modifying SAE activations: increase feature \(i\) by \(s \cdot a_{\max}\) (where \(a_{\max}\) is the max activation at that token), then decode with \(W_{\text{dec}}\).
-- **Current Phase 2** steers by adding a fixed residual vector \(\alpha \cdot W_{\text{dec}}^{(i)}\), independent of SAE activations.
-- To align with their method on Gemma-2-2B:
-  - Load `W_enc`, `b_enc`, and thresholds in `phase2_run.py`.
-  - At the hook, compute SAE activations and `a_max` from the incoming residual.
-  - Change the steering pre-hooks to apply `alpha * a_max * W_dec[fid]` instead of `alpha * W_dec[fid]`.
-  - Optionally, add output-score-based feature filtering on top of your contrast selection.
-
-This brings your feature steering much closer to the setup under which Arad et al. show strong results on the same model family.
+- **Phase 2** now implements the same operator by default. Pass `--legacy_steering` for the old fixed-vector mode.
+- **Feature selection** now supports three complementary methods:
+  - Contrast-based candidate pool (with composite scoring from Bhargav & Zhu).
+  - Output-score filtering (from Arad et al.) for causal effectiveness.
+  - Max-pooling over tokens for stronger activation signals.
+- **Multi-feature steering** lets you combine top-N features into a single intervention.
+- **Layer/width ablation configs** enable testing whether later layers or wider SAEs improve steerability.
+- The full pipeline is: composite contrast selection → output-score filter → activation-scaled steering (single or multi-feature).
 

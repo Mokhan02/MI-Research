@@ -3,6 +3,9 @@ GemmaScope SAE loader (Neuronpedia source).
 
 Downloads and loads decoder weights from NPZ files in the GemmaScope weights repo.
 Does not assume array key names; uses heuristics to find the decoder matrix.
+
+Also supports loading the full SAE (encoder, decoder, bias, threshold) for
+activation-scaled steering (Arad et al., 2025).
 """
 
 import logging
@@ -13,6 +16,25 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+# Canonical NPZ key names across GemmaScope releases
+_KEY_ALIASES = {
+    "W_dec": ["W_dec", "decoder"],
+    "W_enc": ["W_enc", "encoder"],
+    "b_enc": ["b_enc", "encoder_bias"],
+    "threshold": ["threshold", "thr"],
+}
+
+
+def _find_npz_key(data, canonical: str) -> str | None:
+    """Find the first matching key in data for a canonical parameter name."""
+    aliases = _KEY_ALIASES.get(canonical, [canonical])
+    for alias in aliases:
+        for key in data.keys():
+            if alias in key or alias.lower() in key.lower():
+                return key
+    return None
 
 
 def download_sae_npz(repo_id: str, file_path: str, cache_dir: str | None = None) -> str:
@@ -175,3 +197,70 @@ def load_gemmascope_decoder(cfg: dict) -> Tuple[torch.Tensor, dict]:
     }
     logger.info(f"Decoder loaded: shape={decoder.shape}, chosen_key={chosen_key}, transposed={transposed}")
     return decoder, metadata
+
+
+def load_gemmascope_full(cfg: dict) -> dict:
+    """
+    Load full GemmaScope SAE: W_dec, W_enc, b_enc, threshold.
+
+    Uses the same config keys as load_gemmascope_decoder. Returns a dict with:
+        W_dec:      (n_features, d_model) float32 CPU
+        W_enc:      (d_model, n_features) float32 CPU  (always this orientation)
+        b_enc:      (n_features,) float32 CPU
+        threshold:  (n_features,) float32 CPU
+        metadata:   dict with npz_path, keys used, shapes
+    """
+    decoder, meta = load_gemmascope_decoder(cfg)
+    npz_path = meta["npz_path"]
+    n_features = meta["n_features_total"]
+    d_model = meta["d_model"]
+
+    data = np.load(npz_path)
+
+    enc_key = _find_npz_key(data, "W_enc")
+    if enc_key is None:
+        raise ValueError(
+            f"Cannot find encoder weights in NPZ. Keys: {list(data.keys())}. "
+            "Expected a key containing 'W_enc' or 'encoder'."
+        )
+    W_enc = torch.from_numpy(np.asarray(data[enc_key], dtype=np.float32))
+    if W_enc.shape == (n_features, d_model):
+        W_enc = W_enc.T
+    assert W_enc.shape == (d_model, n_features), (
+        f"W_enc shape {W_enc.shape} != expected ({d_model}, {n_features})"
+    )
+
+    benc_key = _find_npz_key(data, "b_enc")
+    if benc_key is None:
+        raise ValueError(
+            f"Cannot find encoder bias in NPZ. Keys: {list(data.keys())}. "
+            "Expected a key containing 'b_enc' or 'encoder_bias'."
+        )
+    b_enc = torch.from_numpy(np.asarray(data[benc_key], dtype=np.float32))
+    assert b_enc.shape == (n_features,), f"b_enc shape {b_enc.shape} != ({n_features},)"
+
+    thr_key = _find_npz_key(data, "threshold")
+    if thr_key is None:
+        raise ValueError(
+            f"Cannot find threshold in NPZ. Keys: {list(data.keys())}. "
+            "Expected a key containing 'threshold' or 'thr'."
+        )
+    threshold = torch.from_numpy(np.asarray(data[thr_key], dtype=np.float32))
+    assert threshold.shape == (n_features,), f"threshold shape {threshold.shape} != ({n_features},)"
+
+    meta["enc_key"] = enc_key
+    meta["benc_key"] = benc_key
+    meta["thr_key"] = thr_key
+
+    logger.info(
+        f"Full SAE loaded: W_dec={decoder.shape}, W_enc={W_enc.shape}, "
+        f"b_enc={b_enc.shape}, threshold={threshold.shape}"
+    )
+
+    return {
+        "W_dec": decoder,
+        "W_enc": W_enc,
+        "b_enc": b_enc,
+        "threshold": threshold,
+        "metadata": meta,
+    }
