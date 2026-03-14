@@ -347,6 +347,9 @@ Other `average_l0_*` options exist per layer/width on the repo if you want spars
 ## 7. Full pipeline (updated)
 
 ```bash
+# 0. Prepare SALADBench prompts (creates salad_select.csv, salad_alpha.csv, salad_holdout.csv in data/prompts)
+uv run python scripts/prepare_salad_bench.py --out_dir data/prompts --n_prompts 300 --seed 42
+
 # 1. Contrast-based candidate pool (composite scoring + max-pool)
 uv run python scripts/phase2_select_contrast.py \
   --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \

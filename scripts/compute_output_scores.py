@@ -43,7 +43,8 @@ def compute_logit_lens_topk(W_dec: torch.Tensor, final_norm, lm_head,
     For each feature, project decoder direction through final layer norm + lm_head.
     Returns top-k token indices per feature: (n_features, k).
     """
-    normed = final_norm(W_dec.float())
+    dtype = next(lm_head.parameters()).dtype
+    normed = final_norm(W_dec.to(dtype=dtype))
     logits = lm_head(normed)
     probs = torch.softmax(logits, dim=-1)
     topk = torch.topk(probs, k=k, dim=-1)
