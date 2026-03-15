@@ -528,7 +528,12 @@ def main():
         with open(args.fixed_features_path) as f:
             data = json.load(f)
         feature_ids = list(data["feature_ids"])
-        print(f"Loaded {len(feature_ids)} feature IDs from {args.fixed_features_path} (skip sampling)")
+        # Cap to n_features when e.g. --micro_sweep sets n_features=10
+        if len(feature_ids) > args.n_features:
+            feature_ids = feature_ids[: args.n_features]
+            print(f"Loaded {len(feature_ids)} feature IDs from {args.fixed_features_path} (capped to n_features={args.n_features})")
+        else:
+            print(f"Loaded {len(feature_ids)} feature IDs from {args.fixed_features_path} (skip sampling)")
     elif args.feature_ids_file:
         with open(args.feature_ids_file) as f:
             feature_ids = [int(x.strip()) for x in f if x.strip()]
