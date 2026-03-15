@@ -51,7 +51,8 @@ def main():
 
     config = resolve_config(load_config(args.config), run_id="alignment_per_example")
     model_id = config["model"]["model_id"]
-    device = args.device or config["model"].get("device", "cuda")
+    from src.model_utils import resolve_device
+    device = resolve_device(args.device or config["model"].get("device", "auto"))
     dtype = config["model"].get("dtype", "bfloat16")
     torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(dtype, torch.bfloat16)
 
