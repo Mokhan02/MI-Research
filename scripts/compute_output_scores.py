@@ -114,6 +114,8 @@ def main():
                     help="Minimum output score to include in filtered set")
     ap.add_argument("--filtered_out", type=str, default=None,
                     help="Path to write filtered selected_features JSON")
+    ap.add_argument("--top_k", type=int, default=None,
+                    help="If set with --filtered_out, write only top K by score (for sanity checks)")
     ap.add_argument("--layer", type=int, default=None,
                     help="Override layer index (default: from config sae.layer_idx)")
     args = ap.parse_args()
@@ -167,11 +169,14 @@ def main():
 
     if args.filtered_out:
         filtered_ids = [int(fid_str) for fid_str, sc in sorted_scores if sc >= args.threshold]
+        if args.top_k is not None:
+            filtered_ids = filtered_ids[: args.top_k]
+            print(f"Top-K: using first {len(filtered_ids)} features by output score")
         payload = {
             "feature_ids": filtered_ids,
             "n_features": len(filtered_ids),
             "source": args.features_path,
-            "filter": f"output_score >= {args.threshold}",
+            "filter": f"output_score >= {args.threshold}" + (f", top_k={args.top_k}" if args.top_k else ""),
             "amp_factor": args.amp_factor,
         }
         Path(args.filtered_out).parent.mkdir(parents=True, exist_ok=True)
