@@ -58,6 +58,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 from tqdm.auto import tqdm
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -737,6 +741,39 @@ def main():
     (output_dir / "plots").mkdir(parents=True, exist_ok=True)
     (output_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
+    # Initialize W&B (spec: sae-refusal-steering project)
+    try:
+        import subprocess as _sp
+        _git_hash = _sp.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=_sp.DEVNULL
+        ).decode().strip()
+    except Exception:
+        _git_hash = "unknown"
+
+    wandb.init(
+        project="sae-refusal-steering",
+        name=f"phase3_{args.run_name}",
+        tags=[
+            f"config_{Path(args.config).stem}",
+            "phase3_predictability",
+        ],
+        config={
+            # Ablation metadata (Section 10)
+            "experiment_type": "full_run",
+            "pipeline_version": "phase3_v2",
+            "git_commit": _git_hash,
+            "run_tag": f"phase3_{args.run_name}",
+
+            "phase": "phase3_predictability",
+            "n_bootstrap": args.n_bootstrap,
+            "tau": args.tau,
+            "topk": args.topk,
+            "run_name": args.run_name,
+            "input_csv": args.input_csv,
+            "phase2_dir": args.phase2_dir,
+        },
+    )
+
     # -----------------------------------------------------------------
     # MODE A: Load pre-merged CSV (analysis only)
     # -----------------------------------------------------------------
@@ -946,6 +983,50 @@ def main():
     top10 = merge.sort_values("alpha_star_best").head(10)
     print(top10[show_cols].to_string(index=False))
 
+    # ==================================================================
+    # W&B Logging
+    # ==================================================================
+
+    # Correlation results as metrics
+    corr_csv = output_dir / "outputs" / "correlation_results.csv"
+    if corr_csv.exists():
+        corr_df = pd.read_csv(corr_csv)
+        corr_metrics = {}
+        for _, row in corr_df.iterrows():
+            m = row["metric"]
+            corr_metrics[f"spearman_r_full/{m}"] = row["r_full"]
+            corr_metrics[f"spearman_p_full/{m}"] = row["p_full"]
+            corr_metrics[f"spearman_r_nocens/{m}"] = row.get("r_nocensored", float("nan"))
+        wandb.log(corr_metrics)
+
+    # Feature metrics table (geometry + steerability)
+    table_cols = ["feature_id", "alpha_star_best", "is_censored", "log_alpha_star"]
+    table_cols += [m for m in GEOMETRY_METRICS if m in merge.columns]
+    for extra in ["act_freq", "mean_act", "density_tau"]:
+        if extra in merge.columns:
+            table_cols.append(extra)
+    feature_table = wandb.Table(dataframe=merge[table_cols].copy())
+    wandb.log({"feature_metrics": feature_table})
+
+    # Scatter plots as images
+    for png in (output_dir / "plots").glob("*.png"):
+        wandb.log({png.stem: wandb.Image(str(png))})
+
+    # Artifacts
+    artifact = wandb.Artifact(
+        name=f"phase3_{args.run_name}",
+        type="analysis_outputs",
+        metadata={"n_features": len(merge), "n_bootstrap": args.n_bootstrap},
+    )
+    for fpath in [corr_csv, output_dir / "outputs" / "summary_stats.csv",
+                  output_dir / "outputs" / "classification_supplementary.csv"]:
+        if fpath.exists():
+            artifact.add_file(str(fpath))
+    for png in (output_dir / "plots").glob("*.png"):
+        artifact.add_file(str(png))
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
     logger.info("Phase 3 analysis complete. Outputs in %s", output_dir)
 
 

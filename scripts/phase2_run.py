@@ -3,13 +3,26 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import os, json, argparse, random, time
+import os, json, argparse, random, time, subprocess
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from itertools import product
 from tqdm.auto import tqdm
+
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def _git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return "unknown"
 
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
@@ -389,6 +402,79 @@ def main():
     dfp = dfp.head(n_prompts).reset_index(drop=True)
     if len(dfp) == 0:
         raise ValueError("No usable prompts in prompt_csv.")
+    # Initialize W&B (spec: sae-refusal-steering project)
+    model_cfg = config.get("model", {})
+    sae_cfg = config.get("sae", {})
+    steering_cfg = config.get("steering", {})
+    bench_cfg = config.get("benchmark", {})
+    gen_cfg = config.get("generation", {})
+
+    experiment_type = "full_run"
+    if args.micro_sweep:
+        experiment_type = "ablation_steering"
+
+    wandb.init(
+        project="sae-refusal-steering",
+        name=f"phase2_run_{args.mode}",
+        tags=[
+            model_cfg.get("model_id", "unknown"),
+            f"layer_{args.layer}",
+            "activation_scaled",
+            "contrast_delta" if args.fixed_features_path else "random",
+            experiment_type,
+        ],
+        config={
+            # Ablation metadata (Section 10)
+            "experiment_type": experiment_type,
+            "pipeline_version": "phase2_run_v2",
+            "git_commit": _git_commit_hash(),
+            "run_tag": f"phase2_run_{args.mode}",
+
+            # Model configuration (Section 2)
+            "model_name": model_cfg.get("model_id"),
+            "model_size": model_cfg.get("model_id", "").split("-")[-1] if model_cfg.get("model_id") else None,
+            "model_checkpoint": model_cfg.get("model_id"),
+            "layer": args.layer,
+            "hook_point": sae_cfg.get("hook_point"),
+            "sae_width": sae_cfg.get("n_features_total"),
+            "sae_repo": sae_cfg.get("weights_repo"),
+            "sae_layer": sae_cfg.get("sae_id"),
+
+            # Steering configuration (Section 2)
+            "steering_method": "activation_scaled",
+            "activation_scale_method": "fixed_alpha",
+            "alpha_values": alphas,
+            "alpha_max": max(alphas, key=abs),
+            "steering_token_position": "last_token" if args.mode == "logit" else "all_tokens",
+
+            # Feature selection configuration (Section 2)
+            "feature_selection_method": "contrast_delta" if args.fixed_features_path else "random",
+            "contrast_scoring_method": "delta_freq" if args.fixed_features_path else "none",
+            "feature_pool_size": args.n_features,
+            "selected_feature_count": args.n_features,
+            "fixed_features_path": args.fixed_features_path,
+
+            # Dataset / Prompt configuration (Section 2)
+            "prompt_dataset": bench_cfg.get("name", "custom"),
+            "prompt_count": n_prompts,
+            "prompt_subset_strategy": "head",
+            "generation_temperature": 0.0,
+            "max_new_tokens": gen_cfg.get("max_new_tokens", 64),
+            "chat_template": model_cfg.get("use_chat_template", True),
+
+            # Evaluation configuration (Section 2)
+            "refusal_scoring_method": "keyword" if args.mode == "refusal" else "logit_delta",
+            "refusal_keywords_version": "v1",
+            "threshold_T": threshold_T,
+
+            # Legacy / extra
+            "mode": args.mode,
+            "seed": args.seed,
+            "micro_sweep": args.micro_sweep,
+            "prompt_csv": prompt_csv,
+        },
+    )
+
     config["model"]["do_sample"] = False
     config["model"]["temperature"] = 0.0
     model, tokenizer = load_model(config)
@@ -481,6 +567,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
 
         pc = prompt_cache[pi]
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
+        steer_norm = float(steer_dir.norm().item())
 
         if alpha == 0.0:
             steer_logits = pc["base_logits"]
@@ -518,6 +605,8 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             "hook_ran": bool(hook_ran),
             "base_rank": base_rank, "steer_rank": steer_rank,
             "target_is_top1": target_is_top1,
+            "steering_vector_norm": steer_norm,
+            "scaled_vector_norm": abs(alpha) * steer_norm,
         }
         buffer.append(row)
         completed_this_session += 1
@@ -535,6 +624,15 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             rate = completed_this_session / max(1e-9, elapsed)
             eta = (total_tasks - done_tasks) / max(1e-9, rate)
             print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+            wandb.log({
+                "tasks_done": done_tasks,
+                "tasks_total": total_tasks,
+                "tasks_per_sec": rate,
+                "eta_min": eta / 60,
+                "delta_logit_target": delta_target,
+                "tv_distance": tv,
+                "kl_base_to_steer": kl,
+            })
 
     if buffer:
         df_out = pd.DataFrame(buffer)
@@ -651,6 +749,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
 
         br = baseline_refusal[pi]
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
+        steer_norm = float(steer_dir.norm().item())
 
         if alpha == 0.0:
             gen_text = br["base_text"]
@@ -670,6 +769,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             "delta_refusal": delta_refusal,
             "hook_ran": bool(hook_ran),
             "gen_text": gen_text[:500],
+            "steering_vector_norm": steer_norm,
+            "scaled_vector_norm": abs(alpha) * steer_norm,
         }
         buffer.append(row)
         completed_this_session += 1
@@ -687,6 +788,14 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             rate = completed_this_session / max(1e-9, elapsed)
             eta = (total_tasks - done_tasks) / max(1e-9, rate)
             print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+            wandb.log({
+                "tasks_done": done_tasks,
+                "tasks_total": total_tasks,
+                "tasks_per_sec": rate,
+                "eta_min": eta / 60,
+                "refusal_score": ref_score,
+                "delta_refusal": delta_refusal,
+            })
 
     if buffer:
         df_out = pd.DataFrame(buffer)
@@ -757,15 +866,67 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
         else:
             refusal_rate_at_max = np.nan
 
+        # Refusal rates at specific alphas (Section 4)
+        refusal_at_alpha = {}
+        for a_probe in [1, 5, 20]:
+            grp_probe = df_feat[df_feat["alpha"] == float(a_probe)]
+            refusal_at_alpha[a_probe] = float(grp_probe["refusal_score"].mean()) if len(grp_probe) > 0 else np.nan
+
+        # Refusal drop max (Section 3): max(baseline - min_refusal_across_alphas)
+        all_alpha_means = df_feat.groupby("alpha")["refusal_score"].mean()
+        min_refusal = float(all_alpha_means.min()) if len(all_alpha_means) > 0 else np.nan
+        refusal_drop_max = base_refusal_rate - min_refusal if not np.isnan(min_refusal) else np.nan
+
+        # Best alpha = the alpha with lowest mean refusal
+        if len(all_alpha_means) > 0:
+            best_alpha_val = float(all_alpha_means.idxmin())
+            best_refusal_val = float(all_alpha_means.min())
+        else:
+            best_alpha_val = np.nan
+            best_refusal_val = np.nan
+
+        # Threshold-independent effect size: min refusal rate and its alpha
+        # (same values as best_*, but named explicitly for clarity)
+        min_refusal_rate = best_refusal_val
+        alpha_at_min_refusal = best_alpha_val
+
+        # Steering diagnostics (Section 7)
+        steer_dir_feat = W_dec[fid].to(device=device, dtype=torch.float32)
+        feat_decoder_norm = float(steer_dir_feat.norm().item())
+
+        # Determine steering direction
+        if not censored_up and not censored_down:
+            steering_dir = "up" if alpha_star_up <= abs(alpha_star_down) else "down"
+        elif not censored_up:
+            steering_dir = "up"
+        elif not censored_down:
+            steering_dir = "down"
+        else:
+            steering_dir = "none"
+
         row = {
             "feature_id": fid,
             "base_refusal_rate": base_refusal_rate,
             "refusal_rate_at_max_alpha": refusal_rate_at_max,
             "refusal_drop_at_max_alpha": base_refusal_rate - refusal_rate_at_max if not np.isnan(refusal_rate_at_max) else np.nan,
+            "refusal_rate_alpha_1": refusal_at_alpha.get(1, np.nan),
+            "refusal_rate_alpha_5": refusal_at_alpha.get(5, np.nan),
+            "refusal_rate_alpha_20": refusal_at_alpha.get(20, np.nan),
+            "refusal_drop_max": refusal_drop_max,
+            "refusal_drop_alpha_5": base_refusal_rate - refusal_at_alpha.get(5, np.nan) if not np.isnan(refusal_at_alpha.get(5, np.nan)) else np.nan,
+            "best_alpha": best_alpha_val,
+            "best_refusal_rate": best_refusal_val,
+            "min_refusal_rate": min_refusal_rate,
+            "alpha_at_min_refusal": alpha_at_min_refusal,
             "alpha_star_feature_up": alpha_star_up,
             "alpha_star_feature_down": alpha_star_down,
             "censored_up": censored_up,
             "censored_down": censored_down,
+            "steering_direction": steering_dir,
+            # Geometry / diagnostics (Sections 5, 7)
+            "decoder_vector_norm": feat_decoder_norm,
+            "feature_l2_norm": feat_decoder_norm,
+            "steering_vector_norm": feat_decoder_norm,
         }
         summary_rows.append(row)
 
@@ -822,6 +983,125 @@ def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_col
         print(feat_summary.sort_values(existing_sort, ascending=True).head(15))
     else:
         print(feat_summary.head(15))
+
+    # ==================================================================
+    # W&B Logging (Sections 3–12 of instrumentation spec)
+    # ==================================================================
+
+    # --- Section 3: Run-Level Metrics ---
+    run_metrics = {"n_features": len(feat_summary), "n_rows": n_rows}
+
+    if "base_refusal_rate" in feat_summary.columns:
+        run_metrics["baseline_refusal_rate"] = float(feat_summary["base_refusal_rate"].mean())
+
+    for a_key, col in [(1, "refusal_rate_alpha_1"), (5, "refusal_rate_alpha_5"), (20, "refusal_rate_alpha_20")]:
+        if col in feat_summary.columns:
+            vals = feat_summary[col].dropna()
+            if len(vals) > 0:
+                run_metrics[f"mean_refusal_alpha_{a_key}"] = float(vals.mean())
+
+    if "refusal_drop_max" in feat_summary.columns:
+        drops = feat_summary["refusal_drop_max"].dropna()
+        if len(drops) > 0:
+            run_metrics["max_refusal_drop"] = float(drops.max())
+            run_metrics["mean_refusal_drop"] = float(drops.mean())
+            run_metrics["median_refusal_drop"] = float(drops.median())
+
+    if "alpha_star_feature_up" in feat_summary.columns:
+        uncensored_up = feat_summary[~feat_summary.get("censored_up", pd.Series(True)).astype(bool)]
+        n_uncensored_up = len(uncensored_up)
+        run_metrics["frac_uncensored_up"] = n_uncensored_up / max(1, len(feat_summary))
+        if n_uncensored_up > 0:
+            vals = uncensored_up["alpha_star_feature_up"].dropna()
+            run_metrics["mean_alpha_star_up"] = float(vals.mean())
+            run_metrics["median_alpha_star_up"] = float(vals.median())
+            run_metrics["std_alpha_star_up"] = float(vals.std())
+
+    if "alpha_star_feature_down" in feat_summary.columns:
+        uncensored_down = feat_summary[~feat_summary.get("censored_down", pd.Series(True)).astype(bool)]
+        run_metrics["frac_uncensored_down"] = len(uncensored_down) / max(1, len(feat_summary))
+        if len(uncensored_down) > 0:
+            vals_dn = uncensored_down["alpha_star_feature_down"].dropna()
+            if len(vals_dn) > 0:
+                run_metrics["mean_alpha_star_down"] = float(vals_dn.mean())
+                run_metrics["median_alpha_star_down"] = float(vals_dn.median())
+                run_metrics["std_alpha_star_down"] = float(vals_dn.std())
+
+    if "best_alpha" in feat_summary.columns:
+        run_metrics["best_alpha"] = float(feat_summary["best_alpha"].dropna().mode().iloc[0]) if len(feat_summary["best_alpha"].dropna()) > 0 else np.nan
+    if "best_refusal_rate" in feat_summary.columns:
+        run_metrics["best_refusal_rate"] = float(feat_summary["best_refusal_rate"].dropna().min()) if len(feat_summary["best_refusal_rate"].dropna()) > 0 else np.nan
+
+    if "min_refusal_rate" in feat_summary.columns:
+        mr = feat_summary["min_refusal_rate"].dropna()
+        if len(mr) > 0:
+            run_metrics["mean_min_refusal_rate"] = float(mr.mean())
+            run_metrics["median_min_refusal_rate"] = float(mr.median())
+
+    wandb.log(run_metrics)
+
+    # --- Section 4 + 5 + 6 + 7: feature_metrics Table ---
+    fm_cols = [c for c in [
+        "feature_id", "alpha_star_feature_up", "alpha_star_feature_down",
+        "censored_up", "censored_down", "steering_direction",
+        "base_refusal_rate",
+        "refusal_rate_alpha_1", "refusal_rate_alpha_5", "refusal_rate_alpha_20",
+        "refusal_drop_max", "refusal_drop_alpha_5",
+        "best_alpha", "best_refusal_rate",
+        "min_refusal_rate", "alpha_at_min_refusal",
+        # Geometry (Section 5)
+        "decoder_vector_norm", "feature_l2_norm",
+        # Steering diagnostics (Section 7)
+        "steering_vector_norm",
+        # Logit-mode extras
+        "tv_mean", "kl_mean", "maxabs_mean", "jacc_mean",
+        "target_delta_mean", "top1_rate_up", "mean_rank_improve",
+        "success_rate_up", "success_rate_down",
+    ] if c in feat_summary.columns]
+
+    feature_metrics_table = wandb.Table(dataframe=feat_summary[fm_cols])
+    wandb.log({"feature_metrics": feature_metrics_table})
+
+    # --- Section 8: feature_curves Table ---
+    curves_df = pd.DataFrame(curve_rows)
+    curve_table_cols = [c for c in [
+        "feature_id", "alpha",
+        "mean_refusal", "std_refusal",
+        "mean_delta", "std_delta",
+        "n_prompts",
+    ] if c in curves_df.columns]
+    feature_curves_table = wandb.Table(dataframe=curves_df[curve_table_cols])
+    wandb.log({"feature_curves": feature_curves_table})
+
+    # --- Section 9: prompt_results Table ---
+    # Read full run_rows and log as table (truncated to avoid OOM)
+    full_df = pd.read_csv(run_csv)
+    pr_cols = [c for c in [
+        "prompt_idx", "feature_id", "alpha",
+        "base_refusal", "refusal_score", "delta_refusal",
+        "gen_text",
+        "delta_logit_target", "tv_distance", "kl_base_to_steer",
+        "hook_ran",
+        "steering_vector_norm", "scaled_vector_norm",
+    ] if c in full_df.columns]
+    # Cap at 10k rows for the table to avoid W&B limits
+    prompt_results_table = wandb.Table(dataframe=full_df[pr_cols].head(10000))
+    wandb.log({"prompt_results": prompt_results_table})
+
+    # --- Section 12: Artifacts ---
+    artifact = wandb.Artifact(
+        name=f"phase2_run_{args.mode}",
+        type="run_outputs",
+        metadata={"n_rows": n_rows, "threshold_T": threshold_T},
+    )
+    for fpath in [run_csv, summary_path, alpha_star_path, curves_path,
+                  selected_features_path, os.path.join(args.out_dir, "meta.json")]:
+        fpath_str = str(fpath)
+        if os.path.exists(fpath_str):
+            artifact.add_file(fpath_str)
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

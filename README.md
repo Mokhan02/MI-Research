@@ -16,13 +16,22 @@ The core thesis: features that are densely clustered in representation space or 
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - GPU recommended (MPS on Apple Silicon, CUDA on Linux/Windows) — CPU works but is slow
 - HuggingFace token for gated model access
+- [Weights & Biases](https://wandb.ai/) account for experiment tracking
 
 ### Installation
 
 ```bash
 uv sync
-export HF_TOKEN=your_token_here
 ```
+
+`.env` should contain:
+
+```
+WANDB_API_KEY=your_wandb_key
+HF_TOKEN=your_hf_token
+```
+
+These are loaded automatically by all scripts (via `python-dotenv`). You do **not** need to `export` them manually.
 
 ### Run the pipeline
 
@@ -98,6 +107,20 @@ Computes pre-steering geometric metrics (max cosine similarity, neighborhood den
 ### Phase 4: Off-Target Analysis
 
 To be implemented. Will measure collateral behavioral effects at α*(f) and at fixed low α₀.
+
+## Experiment Tracking (W&B)
+
+All pipeline scripts log to the `sae-refusal-steering` Weights & Biases project. Each run logs full config, tables, and artifacts per the instrumentation spec.
+
+| Script | Run Name | Tables | Key Metrics |
+|--------|----------|--------|-------------|
+| `phase2_select_contrast.py` | `phase2_select_{domain}` | `feature_metrics` | delta_freq stats, decoder norms |
+| `phase2_run.py` | `phase2_run_{mode}` | `feature_metrics`, `feature_curves`, `prompt_results` | baseline_refusal_rate, refusal_drop_max, alpha_star, steering diagnostics |
+| `phase3_predictability.py` | `phase3_{run_name}` | `feature_metrics` | Spearman correlations, scatter plots |
+
+Every run is tagged with model, layer, steering method, feature selection method, and experiment type for easy filtering. Artifacts (CSVs, Parquet, JSONs) are uploaded via `wandb.Artifact`.
+
+Runs appear at `wandb.ai/<your-entity>/sae-refusal-steering`. Set `WANDB_MODE=disabled` in `.env` to skip logging.
 
 ## Configuration
 
