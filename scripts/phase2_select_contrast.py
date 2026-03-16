@@ -21,6 +21,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -137,6 +141,57 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize W&B (spec: sae-refusal-steering project)
+    model_cfg = config.get("model", {})
+    sae_cfg = config.get("sae", {})
+    try:
+        import subprocess
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        git_hash = "unknown"
+
+    wandb.init(
+        project="sae-refusal-steering",
+        name=f"phase2_select_{args.domain}",
+        tags=[
+            model_cfg.get("model_id", "unknown"),
+            f"layer_{sae_cfg.get('hook_point', 'unknown')}",
+            "contrast_delta",
+            "ablation_contrast",
+        ],
+        config={
+            # Ablation metadata (Section 10)
+            "experiment_type": "ablation_contrast",
+            "pipeline_version": "phase2_select_v2",
+            "git_commit": git_hash,
+            "run_tag": f"phase2_select_{args.domain}",
+
+            # Model
+            "model_name": model_cfg.get("model_id"),
+            "layer": sae_cfg.get("hook_point"),
+            "sae_width": sae_cfg.get("n_features_total"),
+            "sae_repo": sae_cfg.get("weights_repo"),
+
+            # Feature selection (Section 2)
+            "feature_selection_method": "contrast_delta_freq",
+            "contrast_scoring_method": "delta_freq",
+            "feature_pool_size": sae_cfg.get("n_features_total"),
+            "selected_feature_count": args.top_k,
+
+            # Domain / prompts
+            "domain": args.domain,
+            "top_k": args.top_k,
+            "rand_k": args.rand_k,
+            "batch_size": args.batch_size,
+            "tau_act": args.tau_act,
+            "token_span": args.token_span,
+            "seed": args.seed,
+            "config_path": args.config,
+        },
+    )
+
     tau_act = args.tau_act if args.tau_act is not None else float(config.get("features", {}).get("tau_act", 0.0))
     token_span = args.token_span or config.get("features", {}).get("token_span", "last")
     last_n = int(config.get("features", {}).get("token_span_last_n", 1))
@@ -251,6 +306,35 @@ def main():
         f.write("  If ||W_dec|| differs a lot, match on norm or control for it in analysis.\n")
     logger.info("Wrote %s", audit_path)
     logger.info("Top 10 by delta_freq: %s", top_ids[:10])
+
+    # --- W&B Logging ---
+    wandb.log({
+        "n_task_prompts": len(task_select),
+        "n_neutral_prompts": len(neutral_select),
+        "top_k": len(top_ids),
+        "top_delta_freq_max": float(delta_freq[order[0]]),
+        "top_delta_freq_min": float(delta_freq[order[top_k - 1]]) if top_k > 0 else 0.0,
+    })
+
+    # Feature metrics table for selected features
+    selected_summary = summary_task.iloc[top_ids].copy()
+    selected_summary["decoder_vector_norm"] = [float(W_norms[i]) for i in top_ids]
+    feature_table = wandb.Table(dataframe=selected_summary)
+    wandb.log({"feature_metrics": feature_table})
+
+    # Artifacts
+    artifact = wandb.Artifact(
+        name=f"phase2_select_{args.domain}",
+        type="feature_selection",
+        metadata={"domain": args.domain, "top_k": len(top_ids), "seed": args.seed},
+    )
+    for fpath in [summary_task_path, summary_neutral_path, selected_path,
+                  topk_delta_path, rand_path, audit_path]:
+        if Path(fpath).exists():
+            artifact.add_file(str(fpath))
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
