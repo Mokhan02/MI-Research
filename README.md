@@ -110,15 +110,17 @@ To be implemented. Will measure collateral behavioral effects at α*(f) and at f
 
 ## Experiment Tracking (W&B)
 
-All pipeline scripts log to the `algoverse_asmm` Weights & Biases project automatically. Each script creates a separate W&B run:
+All pipeline scripts log to the `sae-refusal-steering` Weights & Biases project. Each run logs full config, tables, and artifacts per the instrumentation spec.
 
-| Script | W&B Run Name | What's Logged |
-|--------|-------------|---------------|
-| `phase2_select_contrast.py` | `phase2_select_{domain}` | Config, prompt counts, top delta_freq stats, output CSVs |
-| `phase2_run.py` | `phase2_run_{mode}` | Config, progress heartbeats, per-step metrics (delta/TV/KL or refusal), alpha_star summary, output CSVs |
-| `phase3_predictability.py` | `phase3_{run_name}` | Config, Spearman correlations per metric, scatter plots, summary stats |
+| Script | Run Name | Tables | Key Metrics |
+|--------|----------|--------|-------------|
+| `phase2_select_contrast.py` | `phase2_select_{domain}` | `feature_metrics` | delta_freq stats, decoder norms |
+| `phase2_run.py` | `phase2_run_{mode}` | `feature_metrics`, `feature_curves`, `prompt_results` | baseline_refusal_rate, refusal_drop_max, alpha_star, steering diagnostics |
+| `phase3_predictability.py` | `phase3_{run_name}` | `feature_metrics` | Spearman correlations, scatter plots |
 
-Runs appear at `wandb.ai/<your-entity>/algoverse_asmm`. Set `WANDB_MODE=disabled` in `.env` to skip logging.
+Every run is tagged with model, layer, steering method, feature selection method, and experiment type for easy filtering. Artifacts (CSVs, Parquet, JSONs) are uploaded via `wandb.Artifact`.
+
+Runs appear at `wandb.ai/<your-entity>/sae-refusal-steering`. Set `WANDB_MODE=disabled` in `.env` to skip logging.
 
 ## Configuration
 
