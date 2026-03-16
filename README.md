@@ -16,13 +16,22 @@ The core thesis: features that are densely clustered in representation space or 
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - GPU recommended (MPS on Apple Silicon, CUDA on Linux/Windows) — CPU works but is slow
 - HuggingFace token for gated model access
+- [Weights & Biases](https://wandb.ai/) account for experiment tracking
 
 ### Installation
 
 ```bash
 uv sync
-export HF_TOKEN=your_token_here
 ```
+
+`.env` should contain:
+
+```
+WANDB_API_KEY=your_wandb_key
+HF_TOKEN=your_hf_token
+```
+
+These are loaded automatically by all scripts (via `python-dotenv`). You do **not** need to `export` them manually.
 
 ### Run the pipeline
 
@@ -98,6 +107,18 @@ Computes pre-steering geometric metrics (max cosine similarity, neighborhood den
 ### Phase 4: Off-Target Analysis
 
 To be implemented. Will measure collateral behavioral effects at α*(f) and at fixed low α₀.
+
+## Experiment Tracking (W&B)
+
+All pipeline scripts log to the `algoverse_asmm` Weights & Biases project automatically. Each script creates a separate W&B run:
+
+| Script | W&B Run Name | What's Logged |
+|--------|-------------|---------------|
+| `phase2_select_contrast.py` | `phase2_select_{domain}` | Config, prompt counts, top delta_freq stats, output CSVs |
+| `phase2_run.py` | `phase2_run_{mode}` | Config, progress heartbeats, per-step metrics (delta/TV/KL or refusal), alpha_star summary, output CSVs |
+| `phase3_predictability.py` | `phase3_{run_name}` | Config, Spearman correlations per metric, scatter plots, summary stats |
+
+Runs appear at `wandb.ai/<your-entity>/algoverse_asmm`. Set `WANDB_MODE=disabled` in `.env` to skip logging.
 
 ## Configuration
 

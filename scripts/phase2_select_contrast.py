@@ -21,6 +21,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -137,6 +141,21 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize W&B
+    wandb.init(
+        project="algoverse_asmm",
+        name=f"phase2_select_{args.domain}",
+        config={
+            "phase": "phase2_select",
+            "domain": args.domain,
+            "top_k": args.top_k,
+            "rand_k": args.rand_k,
+            "batch_size": args.batch_size,
+            "seed": args.seed,
+            "config_path": args.config,
+        },
+    )
+
     tau_act = args.tau_act if args.tau_act is not None else float(config.get("features", {}).get("tau_act", 0.0))
     token_span = args.token_span or config.get("features", {}).get("token_span", "last")
     last_n = int(config.get("features", {}).get("token_span_last_n", 1))
@@ -251,6 +270,18 @@ def main():
         f.write("  If ||W_dec|| differs a lot, match on norm or control for it in analysis.\n")
     logger.info("Wrote %s", audit_path)
     logger.info("Top 10 by delta_freq: %s", top_ids[:10])
+
+    # Log to W&B
+    wandb.log({
+        "n_task_prompts": len(task_select),
+        "n_neutral_prompts": len(neutral_select),
+        "top_k": len(top_ids),
+        "top_delta_freq_max": float(delta_freq[order[0]]),
+        "top_delta_freq_min": float(delta_freq[order[top_k - 1]]) if top_k > 0 else 0.0,
+    })
+    wandb.save(str(summary_task_path))
+    wandb.save(str(selected_path))
+    wandb.finish()
 
 
 if __name__ == "__main__":

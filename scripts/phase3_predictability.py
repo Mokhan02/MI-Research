@@ -58,6 +58,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 from tqdm.auto import tqdm
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -737,6 +741,21 @@ def main():
     (output_dir / "plots").mkdir(parents=True, exist_ok=True)
     (output_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
+    # Initialize W&B
+    wandb.init(
+        project="algoverse_asmm",
+        name=f"phase3_{args.run_name}",
+        config={
+            "phase": "phase3_predictability",
+            "n_bootstrap": args.n_bootstrap,
+            "tau": args.tau,
+            "topk": args.topk,
+            "run_name": args.run_name,
+            "input_csv": args.input_csv,
+            "phase2_dir": args.phase2_dir,
+        },
+    )
+
     # -----------------------------------------------------------------
     # MODE A: Load pre-merged CSV (analysis only)
     # -----------------------------------------------------------------
@@ -946,6 +965,27 @@ def main():
     top10 = merge.sort_values("alpha_star_best").head(10)
     print(top10[show_cols].to_string(index=False))
 
+    # Log final results to W&B
+    corr_csv = output_dir / "outputs" / "correlation_results.csv"
+    if corr_csv.exists():
+        corr_df = pd.read_csv(corr_csv)
+        for _, row in corr_df.iterrows():
+            wandb.log({
+                f"spearman_r_full/{row['metric']}": row["r_full"],
+                f"spearman_p_full/{row['metric']}": row["p_full"],
+                f"spearman_r_nocens/{row['metric']}": row.get("r_nocensored", float("nan")),
+            })
+        wandb.save(str(corr_csv))
+
+    summary_csv = output_dir / "outputs" / "summary_stats.csv"
+    if summary_csv.exists():
+        wandb.save(str(summary_csv))
+
+    # Save scatter plots
+    for png in (output_dir / "plots").glob("*.png"):
+        wandb.log({png.stem: wandb.Image(str(png))})
+
+    wandb.finish()
     logger.info("Phase 3 analysis complete. Outputs in %s", output_dir)
 
 

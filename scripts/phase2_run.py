@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from itertools import product
 from tqdm.auto import tqdm
 
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
 from src.sae_loader import load_gemmascope_decoder
@@ -389,6 +394,26 @@ def main():
     dfp = dfp.head(n_prompts).reset_index(drop=True)
     if len(dfp) == 0:
         raise ValueError("No usable prompts in prompt_csv.")
+    # Initialize W&B
+    wandb.init(
+        project="algoverse_asmm",
+        name=f"phase2_run_{args.mode}",
+        config={
+            "phase": "phase2_run",
+            "mode": args.mode,
+            "n_prompts": n_prompts,
+            "n_features": args.n_features,
+            "alphas": alphas,
+            "threshold_T": threshold_T,
+            "seed": args.seed,
+            "layer": args.layer,
+            "micro_sweep": args.micro_sweep,
+            "prompt_csv": prompt_csv,
+            **{f"config.{k}": v for k, v in config.get("model", {}).items()},
+            **{f"config.sae.{k}": v for k, v in config.get("sae", {}).items()},
+        },
+    )
+
     config["model"]["do_sample"] = False
     config["model"]["temperature"] = 0.0
     model, tokenizer = load_model(config)
@@ -535,6 +560,15 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             rate = completed_this_session / max(1e-9, elapsed)
             eta = (total_tasks - done_tasks) / max(1e-9, rate)
             print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+            wandb.log({
+                "tasks_done": done_tasks,
+                "tasks_total": total_tasks,
+                "tasks_per_sec": rate,
+                "eta_min": eta / 60,
+                "delta_logit_target": delta_target,
+                "tv_distance": tv,
+                "kl_base_to_steer": kl,
+            })
 
     if buffer:
         df_out = pd.DataFrame(buffer)
@@ -687,6 +721,14 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             rate = completed_this_session / max(1e-9, elapsed)
             eta = (total_tasks - done_tasks) / max(1e-9, rate)
             print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+            wandb.log({
+                "tasks_done": done_tasks,
+                "tasks_total": total_tasks,
+                "tasks_per_sec": rate,
+                "eta_min": eta / 60,
+                "refusal_score": ref_score,
+                "delta_refusal": delta_refusal,
+            })
 
     if buffer:
         df_out = pd.DataFrame(buffer)
@@ -822,6 +864,20 @@ def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_col
         print(feat_summary.sort_values(existing_sort, ascending=True).head(15))
     else:
         print(feat_summary.head(15))
+
+    # Log summary to W&B
+    wandb.log({"n_features": len(feat_summary), "n_rows": n_rows})
+    if "alpha_star_feature_up" in feat_summary.columns:
+        uncensored = feat_summary[~feat_summary.get("censored_up", pd.Series(False))]
+        if len(uncensored) > 0:
+            wandb.log({
+                "alpha_star_up_median": float(uncensored["alpha_star_feature_up"].median()),
+                "alpha_star_up_mean": float(uncensored["alpha_star_feature_up"].mean()),
+            })
+    wandb.save(str(run_csv))
+    wandb.save(summary_path)
+    wandb.save(alpha_star_path)
+    wandb.finish()
 
 
 if __name__ == "__main__":
