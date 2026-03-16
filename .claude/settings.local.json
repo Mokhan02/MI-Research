@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wc -l src/*.py scripts/*.py configs/*.yaml configs/targets/*.yaml)"
+      "Bash(wc -l src/*.py scripts/*.py configs/*.yaml configs/targets/*.yaml)",
+      "Bash(wc:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)"
     ]
   }
 }

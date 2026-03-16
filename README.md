@@ -28,18 +28,18 @@ export HF_TOKEN=your_token_here
 
 ```bash
 # 1. Contrast feature selection (real model + SAE)
-PYTHONPATH=. uv run python scripts/phase2_select_contrast.py \
+uv run python scripts/phase2_select_contrast.py \
   --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
   --domain planets --out_dir outputs/phase2_select --top-k 100
 
 # 2. Measure steerability (real SAE, matched features + prompts)
-PYTHONPATH=. uv run python scripts/phase2_run.py \
+uv run python scripts/phase2_run.py \
   --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
   --out_dir outputs/phase2 --n_prompts 100 \
   --fixed_features_path outputs/phase2_select/selected_features_planets.json
 
 # 3. Predict α* from geometry
-PYTHONPATH=. uv run python scripts/phase3_predictability.py \
+uv run python scripts/phase3_predictability.py \
   --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
   --phase2_dir outputs/phase2 --out_dir outputs/phase3
 ```
