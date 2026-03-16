@@ -885,6 +885,11 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             best_alpha_val = np.nan
             best_refusal_val = np.nan
 
+        # Threshold-independent effect size: min refusal rate and its alpha
+        # (same values as best_*, but named explicitly for clarity)
+        min_refusal_rate = best_refusal_val
+        alpha_at_min_refusal = best_alpha_val
+
         # Steering diagnostics (Section 7)
         steer_dir_feat = W_dec[fid].to(device=device, dtype=torch.float32)
         feat_decoder_norm = float(steer_dir_feat.norm().item())
@@ -911,6 +916,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             "refusal_drop_alpha_5": base_refusal_rate - refusal_at_alpha.get(5, np.nan) if not np.isnan(refusal_at_alpha.get(5, np.nan)) else np.nan,
             "best_alpha": best_alpha_val,
             "best_refusal_rate": best_refusal_val,
+            "min_refusal_rate": min_refusal_rate,
+            "alpha_at_min_refusal": alpha_at_min_refusal,
             "alpha_star_feature_up": alpha_star_up,
             "alpha_star_feature_down": alpha_star_down,
             "censored_up": censored_up,
@@ -1025,6 +1032,12 @@ def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_col
     if "best_refusal_rate" in feat_summary.columns:
         run_metrics["best_refusal_rate"] = float(feat_summary["best_refusal_rate"].dropna().min()) if len(feat_summary["best_refusal_rate"].dropna()) > 0 else np.nan
 
+    if "min_refusal_rate" in feat_summary.columns:
+        mr = feat_summary["min_refusal_rate"].dropna()
+        if len(mr) > 0:
+            run_metrics["mean_min_refusal_rate"] = float(mr.mean())
+            run_metrics["median_min_refusal_rate"] = float(mr.median())
+
     wandb.log(run_metrics)
 
     # --- Section 4 + 5 + 6 + 7: feature_metrics Table ---
@@ -1035,6 +1048,7 @@ def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_col
         "refusal_rate_alpha_1", "refusal_rate_alpha_5", "refusal_rate_alpha_20",
         "refusal_drop_max", "refusal_drop_alpha_5",
         "best_alpha", "best_refusal_rate",
+        "min_refusal_rate", "alpha_at_min_refusal",
         # Geometry (Section 5)
         "decoder_vector_norm", "feature_l2_norm",
         # Steering diagnostics (Section 7)
