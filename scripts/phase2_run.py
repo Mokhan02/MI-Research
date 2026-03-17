@@ -3,13 +3,26 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import os, json, argparse, random, time
+import os, json, argparse, random, time, subprocess
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from itertools import product
 from tqdm.auto import tqdm
+
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def _git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return "unknown"
 
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
@@ -23,11 +36,14 @@ def set_determinism(seed: int = 1234):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        # TF32 is A100's native fast path — ≈1.4x throughput with negligible
+        # precision loss for logit-delta / generation scoring experiments.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 def nanmean_or_nan(x):
     """Mean of finite values, or NaN if none. No RuntimeWarning on empty slice."""
@@ -68,6 +84,31 @@ def forward_last_logits(model, tokenizer, prompt: str, prehook=None):
     resid_last = out.hidden_states[-1][0, -1, :].float().detach()
     return logits, inputs["input_ids"][0], resid_last
 
+
+@torch.no_grad()
+def forward_last_logits_batch(model, tokenizer, prompts: list, prehook=None):
+    """Batched version of forward_last_logits.
+
+    Returns list of (logits_fp32, input_ids, resid_fp32) — one per prompt.
+    Left-pads so the last real token aligns at position -1 for each row.
+    """
+    device = next(model.parameters()).device
+    # Left-pad: last token of each un-padded sequence is at index -1
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+    handle = prehook() if prehook else None
+    out = model(**inputs, output_hidden_states=True)
+    if handle is not None:
+        handle.remove()
+
+    # For left-padded inputs the last token is always at position -1
+    results = []
+    for i in range(len(prompts)):
+        logits = out.logits[i, -1, :].float().detach()
+        resid = out.hidden_states[-1][i, -1, :].float().detach()
+        results.append((logits, inputs["input_ids"][i], resid))
+    return results
+
 @torch.no_grad()
 def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, prehook=None, use_chat_template: bool = False):
     """Generate a short response with optional steering hook. Returns generated text (excluding prompt)."""
@@ -86,6 +127,45 @@ def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, pr
         handle.remove()
     gen_ids = out_ids[0, inputs["input_ids"].shape[1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+@torch.no_grad()
+def generate_steered_batch(
+    model, tokenizer, prompts: list, max_new_tokens: int = 64,
+    prehook=None, use_chat_template: bool = False,
+):
+    """Batched generation with optional steering hook.
+
+    Returns list of generated strings (excluding their respective prompts),
+    one per input prompt, in the same order.
+    """
+    device = next(model.parameters()).device
+
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        texts = []
+        for p in prompts:
+            chat = [{"role": "user", "content": p}]
+            texts.append(tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True))
+    else:
+        texts = list(prompts)
+
+    # Left-pad so all sequences end at the same position before new tokens
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(texts, return_tensors="pt", padding=True).to(device)
+    prompt_lens = inputs["input_ids"].shape[1]  # same for all after left-pad
+
+    handle = prehook() if prehook else None
+    out_ids = model.generate(
+        **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+    )
+    if handle is not None:
+        handle.remove()
+
+    results = []
+    for i in range(len(prompts)):
+        gen_ids = out_ids[i, prompt_lens:]
+        results.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+    return results
 
 
 def make_steer_prehook_all_pos(model, layer_idx: int, alpha: float, steer_dir: torch.Tensor):
@@ -446,6 +526,9 @@ def main():
                          "(sum of decoder directions). When set, runs a single combined-feature "
                          "sweep over alphas instead of per-feature. Requires --fixed_features_path "
                          "with features ordered by score (top first).")
+    ap.add_argument("--batch_size", type=int, default=16,
+                    help="Number of prompts to process in parallel per (feature, alpha) pair. "
+                         "Larger values use more GPU memory but give better throughput. Default 16.")
     args = ap.parse_args()
 
     if args.micro_sweep:
@@ -499,6 +582,79 @@ def main():
     dfp = dfp.head(n_prompts).reset_index(drop=True)
     if len(dfp) == 0:
         raise ValueError("No usable prompts in prompt_csv.")
+    # Initialize W&B (spec: sae-refusal-steering project)
+    model_cfg = config.get("model", {})
+    sae_cfg = config.get("sae", {})
+    steering_cfg = config.get("steering", {})
+    bench_cfg = config.get("benchmark", {})
+    gen_cfg = config.get("generation", {})
+
+    experiment_type = "full_run"
+    if args.micro_sweep:
+        experiment_type = "ablation_steering"
+
+    wandb.init(
+        project="sae-refusal-steering",
+        name=f"phase2_run_{args.mode}",
+        tags=[
+            model_cfg.get("model_id", "unknown"),
+            f"layer_{args.layer}",
+            "activation_scaled",
+            "contrast_delta" if args.fixed_features_path else "random",
+            experiment_type,
+        ],
+        config={
+            # Ablation metadata (Section 10)
+            "experiment_type": experiment_type,
+            "pipeline_version": "phase2_run_v2",
+            "git_commit": _git_commit_hash(),
+            "run_tag": f"phase2_run_{args.mode}",
+
+            # Model configuration (Section 2)
+            "model_name": model_cfg.get("model_id"),
+            "model_size": model_cfg.get("model_id", "").split("-")[-1] if model_cfg.get("model_id") else None,
+            "model_checkpoint": model_cfg.get("model_id"),
+            "layer": args.layer,
+            "hook_point": sae_cfg.get("hook_point"),
+            "sae_width": sae_cfg.get("n_features_total"),
+            "sae_repo": sae_cfg.get("weights_repo"),
+            "sae_layer": sae_cfg.get("sae_id"),
+
+            # Steering configuration (Section 2)
+            "steering_method": "activation_scaled",
+            "activation_scale_method": "fixed_alpha",
+            "alpha_values": alphas,
+            "alpha_max": max(alphas, key=abs),
+            "steering_token_position": "last_token" if args.mode == "logit" else "all_tokens",
+
+            # Feature selection configuration (Section 2)
+            "feature_selection_method": "contrast_delta" if args.fixed_features_path else "random",
+            "contrast_scoring_method": "delta_freq" if args.fixed_features_path else "none",
+            "feature_pool_size": args.n_features,
+            "selected_feature_count": args.n_features,
+            "fixed_features_path": args.fixed_features_path,
+
+            # Dataset / Prompt configuration (Section 2)
+            "prompt_dataset": bench_cfg.get("name", "custom"),
+            "prompt_count": n_prompts,
+            "prompt_subset_strategy": "head",
+            "generation_temperature": 0.0,
+            "max_new_tokens": gen_cfg.get("max_new_tokens", 64),
+            "chat_template": model_cfg.get("use_chat_template", True),
+
+            # Evaluation configuration (Section 2)
+            "refusal_scoring_method": "keyword" if args.mode == "refusal" else "logit_delta",
+            "refusal_keywords_version": "v1",
+            "threshold_T": threshold_T,
+
+            # Legacy / extra
+            "mode": args.mode,
+            "seed": args.seed,
+            "micro_sweep": args.micro_sweep,
+            "prompt_csv": prompt_csv,
+        },
+    )
+
     config["model"]["do_sample"] = False
     config["model"]["temperature"] = 0.0
     model, tokenizer = load_model(config)
@@ -569,26 +725,38 @@ def main():
 # Logit mode (factual QA: delta_logit_target)
 # ===========================================================
 def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc=None):
+# ======================================================def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
     device = next(model.parameters()).device
 
     lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
 
-    print(f"Computing baselines for {len(dfp)} prompts...")
+    # ------------------------------------------------------------------
+    # Batched baseline computation
+    # ------------------------------------------------------------------
+    print(f"Computing baselines for {len(dfp)} prompts (batch_size={args.batch_size})...")
     prompt_cache = {}
-    for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baselines"):
-        prompt = prow["prompt"]
-        target_id = encode_target(tokenizer, prow.get("target", np.nan))
-        base_logits, input_ids, base_resid = forward_last_logits(model, tokenizer, prompt)
-        seq_len = int(input_ids.shape[0])
-        pos = seq_len - 1
-        if target_id is None:
-            target_id = int(torch.argmax(base_logits).item())
-        w_t = lm_head_w[target_id]
-        base_t = torch.dot(base_resid, w_t)
-        prompt_cache[pi] = dict(
-            prompt=prompt, base_logits=base_logits, base_resid=base_resid,
-            seq_len=seq_len, pos=pos, target_id=target_id, w_t=w_t, base_t=base_t,
-        )
+    prompt_list = list(dfp.iterrows())
+    for batch_start in tqdm(range(0, len(prompt_list), args.batch_size), desc="Baselines"):
+        batch = prompt_list[batch_start: batch_start + args.batch_size]
+        batch_pis = [pi for pi, _ in batch]
+        batch_prompts = [prow["prompt"] for _, prow in batch]
+        batch_target_ids = [encode_target(tokenizer, prow.get("target", np.nan)) for _, prow in batch]
+
+        batch_results = forward_last_logits_batch(model, tokenizer, batch_prompts)
+
+        for (pi, prow), target_id, (base_logits, input_ids, base_resid) in zip(
+            batch, batch_target_ids, batch_results
+        ):
+            seq_len = int(input_ids.shape[0])
+            pos = seq_len - 1
+            if target_id is None:
+                target_id = int(torch.argmax(base_logits).item())
+            w_t = lm_head_w[target_id]
+            base_t = torch.dot(base_resid, w_t)
+            prompt_cache[pi] = dict(
+                prompt=prow["prompt"], base_logits=base_logits, base_resid=base_resid,
+                seq_len=seq_len, pos=pos, target_id=target_id, w_t=w_t, base_t=base_t,
+            )
 
     all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
     total_tasks = len(all_jobs)
@@ -604,13 +772,18 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
 
     print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
 
+    prompt_indices = list(dfp.index)
+    batch_size = args.batch_size
     completed_this_session = 0
-    for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering")):
-        if (pi, fid, alpha) in done:
-            continue
 
-        pc = prompt_cache[pi]
+    # Outer loop: (feature, alpha) — one batched forward per pair instead of
+    # one forward per (prompt, feature, alpha).
+    fa_pairs = list(dict.fromkeys(product(feature_ids, alphas_sorted)))
+    pbar = tqdm(total=total_tasks, desc="Steering")
+
+    for fid, alpha in fa_pairs:
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
+        steer_norm = float(steer_dir.norm().item())
 
         if alpha == 0.0:
             steer_logits = pc["base_logits"]
@@ -643,33 +816,126 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
         base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
         steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
         target_is_top1 = bool(steer_rank == 1)
+        # Split prompts into mini-batches
+        for batch_start in range(0, len(prompt_indices), batch_size):
+            batch_pis = prompt_indices[batch_start: batch_start + batch_size]
 
-        row = {
-            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
-            "seq_len": pc["seq_len"], "target_id": int(tid),
-            "delta_logit_target": delta_target,
-            "tv_distance": tv, "kl_base_to_steer": kl,
-            "topk_jaccard": jac, "max_abs_dlogit": max_abs,
-            "hook_ran": bool(hook_ran),
-            "base_rank": base_rank, "steer_rank": steer_rank,
-            "target_is_top1": target_is_top1,
-        }
-        buffer.append(row)
-        completed_this_session += 1
+            # Check which prompts in this batch still need to be computed
+            pending_pis = [pi for pi in batch_pis if (pi, fid, alpha) not in done]
+            already_done = len(batch_pis) - len(pending_pis)
+            pbar.update(already_done)
+            completed_this_session += already_done  # count skipped toward heartbeat
 
-        if len(buffer) >= args.flush_every:
-            df_out = pd.DataFrame(buffer)
-            header = not run_csv.exists()
-            df_out.to_csv(run_csv, mode="a", header=header, index=False)
-            buffer.clear()
-            print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
+            if not pending_pis:
+                continue
 
-        done_tasks = len(done) + completed_this_session
-        if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
-            elapsed = time.time() - start_time
-            rate = completed_this_session / max(1e-9, elapsed)
-            eta = (total_tasks - done_tasks) / max(1e-9, rate)
-            print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+            if alpha == 0.0:
+                # alpha=0: reuse baseline, no model call
+                for pi in pending_pis:
+                    pc = prompt_cache[pi]
+                    steer_logits = pc["base_logits"]
+                    steer_resid = pc["base_resid"]
+
+                    steer_t = torch.dot(steer_resid, pc["w_t"])
+                    delta_target = float((steer_t - pc["base_t"]).item())
+                    d = steer_logits - pc["base_logits"]
+                    max_abs = float(d.abs().max().item())
+                    tv = tv_distance_from_logits(pc["base_logits"], steer_logits)
+                    kl = kl_pq_from_logits(pc["base_logits"], steer_logits)
+                    jac = topk_jaccard(pc["base_logits"], steer_logits, k=args.topk)
+                    tid = pc["target_id"]
+                    base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
+                    steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
+
+                    buffer.append({
+                        "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+                        "seq_len": pc["seq_len"], "target_id": int(tid),
+                        "delta_logit_target": delta_target,
+                        "tv_distance": tv, "kl_base_to_steer": kl,
+                        "topk_jaccard": jac, "max_abs_dlogit": max_abs,
+                        "hook_ran": True,
+                        "base_rank": base_rank, "steer_rank": steer_rank,
+                        "target_is_top1": bool(steer_rank == 1),
+                        "steering_vector_norm": steer_norm,
+                        "scaled_vector_norm": 0.0,
+                    })
+                    completed_this_session += 1
+                    pbar.update(1)
+            else:
+                # NOTE: the position-specific hook requires different pos per prompt,
+                # so we group prompts by their sequence length so that prompts with the
+                # same pos share a single batched forward pass.
+                by_pos: dict = {}
+                for pi in pending_pis:
+                    pos = prompt_cache[pi]["pos"]
+                    by_pos.setdefault(pos, []).append(pi)
+
+                for pos, pis_at_pos in by_pos.items():
+                    mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pos, steer_dir)
+                    prompts_batch = [prompt_cache[pi]["prompt"] for pi in pis_at_pos]
+
+                    t0 = time.time()
+                    batch_results = forward_last_logits_batch(
+                        model, tokenizer, prompts_batch, prehook=mk_hook
+                    )
+                    t1 = time.time()
+                    hook_ran = cap["ok"]
+                    if (t1 - t0) > 5.0:
+                        print(f"[SLOW] batch forward {t1-t0:.2f}s  feat={fid} alpha={alpha} n={len(pis_at_pos)}")
+
+                    for pi, (steer_logits, _, steer_resid) in zip(pis_at_pos, batch_results):
+                        pc = prompt_cache[pi]
+                        steer_t = torch.dot(steer_resid, pc["w_t"])
+                        delta_target = float((steer_t - pc["base_t"]).item())
+                        d = steer_logits - pc["base_logits"]
+                        max_abs = float(d.abs().max().item())
+                        tv = tv_distance_from_logits(pc["base_logits"], steer_logits)
+                        kl = kl_pq_from_logits(pc["base_logits"], steer_logits)
+                        jac = topk_jaccard(pc["base_logits"], steer_logits, k=args.topk)
+                        tid = pc["target_id"]
+                        base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
+                        steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
+
+                        buffer.append({
+                            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+                            "seq_len": pc["seq_len"], "target_id": int(tid),
+                            "delta_logit_target": delta_target,
+                            "tv_distance": tv, "kl_base_to_steer": kl,
+                            "topk_jaccard": jac, "max_abs_dlogit": max_abs,
+                            "hook_ran": bool(hook_ran),
+                            "base_rank": base_rank, "steer_rank": steer_rank,
+                            "target_is_top1": bool(steer_rank == 1),
+                            "steering_vector_norm": steer_norm,
+                            "scaled_vector_norm": abs(alpha) * steer_norm,
+                        })
+                        completed_this_session += 1
+                        pbar.update(1)
+
+            if len(buffer) >= args.flush_every:
+                df_out = pd.DataFrame(buffer)
+                header = not run_csv.exists()
+                df_out.to_csv(run_csv, mode="a", header=header, index=False)
+                buffer.clear()
+                print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
+
+            done_tasks = len(done) + completed_this_session
+            if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
+                elapsed = time.time() - start_time
+                rate = completed_this_session / max(1e-9, elapsed)
+                eta = (total_tasks - done_tasks) / max(1e-9, rate)
+                print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+                last_row = buffer[-1] if buffer else {}
+                wandb.log({
+                    "tasks_done": done_tasks,
+                    "tasks_total": total_tasks,
+                    "tasks_per_sec": rate,
+                    "eta_min": eta / 60,
+                    "delta_logit_target": last_row.get("delta_logit_target", float("nan")),
+                    "tv_distance": last_row.get("tv_distance", float("nan")),
+                    "kl_base_to_steer": last_row.get("kl_base_to_steer", float("nan")),
+                })
+
+    pbar.close()
 
     if buffer:
         df_out = pd.DataFrame(buffer)
@@ -758,15 +1024,29 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
 
     use_chat = config.get("model", {}).get("use_chat_template", True)
-    print(f"[Refusal mode] use_chat_template={use_chat}, computing baseline generations for {len(dfp)} prompts...")
+    batch_size = args.batch_size
+    print(f"[Refusal mode] use_chat_template={use_chat}, batch_size={batch_size}")
+    print(f"Computing baseline generations for {len(dfp)} prompts...")
+
+    # ------------------------------------------------------------------
+    # Batched baseline generation
+    # ------------------------------------------------------------------
     baseline_refusal = {}
-    for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baseline gen"):
-        text = generate_steered(model, tokenizer, prow["prompt"], max_new_tokens=max_new_tokens, use_chat_template=use_chat)
-        baseline_refusal[pi] = {
-            "prompt": prow["prompt"],
-            "base_text": text,
-            "base_refusal": _refusal_score(text),
-        }
+    prompt_list = list(dfp.iterrows())
+    for batch_start in tqdm(range(0, len(prompt_list), batch_size), desc="Baseline gen"):
+        batch = prompt_list[batch_start: batch_start + batch_size]
+        batch_pis = [pi for pi, _ in batch]
+        batch_prompts = [prow["prompt"] for _, prow in batch]
+        gen_texts = generate_steered_batch(
+            model, tokenizer, batch_prompts,
+            max_new_tokens=max_new_tokens, use_chat_template=use_chat,
+        )
+        for pi, prompt, text in zip(batch_pis, batch_prompts, gen_texts):
+            baseline_refusal[pi] = {
+                "prompt": prompt,
+                "base_text": text,
+                "base_refusal": _refusal_score(text),
+            }
 
     all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
     total_tasks = len(all_jobs)
@@ -782,13 +1062,16 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
 
     print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
 
+    prompt_indices = list(dfp.index)
     completed_this_session = 0
-    for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering (refusal)")):
-        if (pi, fid, alpha) in done:
-            continue
 
-        br = baseline_refusal[pi]
+    # Outer loop: (feature, alpha) — one batched generate per pair.
+    fa_pairs = list(dict.fromkeys(product(feature_ids, alphas_sorted)))
+    pbar = tqdm(total=total_tasks, desc="Steering (refusal)")
+
+    for fid, alpha in fa_pairs:
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
+        steer_norm = float(steer_dir.norm().item())
 
         if alpha == 0.0:
             gen_text = br["base_text"]
@@ -802,34 +1085,72 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
             gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat)
             hook_ran = cap["ok"]
+        for batch_start in range(0, len(prompt_indices), batch_size):
+            batch_pis = prompt_indices[batch_start: batch_start + batch_size]
 
-        ref_score = _refusal_score(gen_text)
-        delta_refusal = ref_score - br["base_refusal"]
+            pending_pis = [pi for pi in batch_pis if (pi, fid, alpha) not in done]
+            already_done = len(batch_pis) - len(pending_pis)
+            pbar.update(already_done)
+            completed_this_session += already_done
 
-        row = {
-            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
-            "refusal_score": ref_score,
-            "base_refusal": br["base_refusal"],
-            "delta_refusal": delta_refusal,
-            "hook_ran": bool(hook_ran),
-            "gen_text": gen_text[:500],
-        }
-        buffer.append(row)
-        completed_this_session += 1
+            if not pending_pis:
+                continue
 
-        if len(buffer) >= args.flush_every:
-            df_out = pd.DataFrame(buffer)
-            header = not run_csv.exists()
-            df_out.to_csv(run_csv, mode="a", header=header, index=False)
-            buffer.clear()
-            print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
+            if alpha == 0.0:
+                # Reuse cached baseline — no model call
+                gen_texts = [baseline_refusal[pi]["base_text"] for pi in pending_pis]
+                hook_ran = True
+            else:
+                mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
+                batch_prompts = [baseline_refusal[pi]["prompt"] for pi in pending_pis]
+                gen_texts = generate_steered_batch(
+                    model, tokenizer, batch_prompts,
+                    max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat,
+                )
+                hook_ran = cap["ok"]
 
-        done_tasks = len(done) + completed_this_session
-        if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
-            elapsed = time.time() - start_time
-            rate = completed_this_session / max(1e-9, elapsed)
-            eta = (total_tasks - done_tasks) / max(1e-9, rate)
-            print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+            for pi, gen_text in zip(pending_pis, gen_texts):
+                br = baseline_refusal[pi]
+                ref_score = _refusal_score(gen_text)
+                delta_refusal = ref_score - br["base_refusal"]
+
+                buffer.append({
+                    "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+                    "refusal_score": ref_score,
+                    "base_refusal": br["base_refusal"],
+                    "delta_refusal": delta_refusal,
+                    "hook_ran": bool(hook_ran),
+                    "gen_text": gen_text[:500],
+                    "steering_vector_norm": steer_norm,
+                    "scaled_vector_norm": abs(alpha) * steer_norm,
+                })
+                completed_this_session += 1
+                pbar.update(1)
+
+            if len(buffer) >= args.flush_every:
+                df_out = pd.DataFrame(buffer)
+                header = not run_csv.exists()
+                df_out.to_csv(run_csv, mode="a", header=header, index=False)
+                buffer.clear()
+                print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
+
+            done_tasks = len(done) + completed_this_session
+            if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
+                elapsed = time.time() - start_time
+                rate = completed_this_session / max(1e-9, elapsed)
+                eta = (total_tasks - done_tasks) / max(1e-9, rate)
+                print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
+                last_row = buffer[-1] if buffer else {}
+                wandb.log({
+                    "tasks_done": done_tasks,
+                    "tasks_total": total_tasks,
+                    "tasks_per_sec": rate,
+                    "eta_min": eta / 60,
+                    "refusal_score": last_row.get("refusal_score", float("nan")),
+                    "delta_refusal": last_row.get("delta_refusal", float("nan")),
+                })
+
+    pbar.close()
 
     if buffer:
         df_out = pd.DataFrame(buffer)
@@ -900,15 +1221,67 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
         else:
             refusal_rate_at_max = np.nan
 
+        # Refusal rates at specific alphas (Section 4)
+        refusal_at_alpha = {}
+        for a_probe in [1, 5, 20]:
+            grp_probe = df_feat[df_feat["alpha"] == float(a_probe)]
+            refusal_at_alpha[a_probe] = float(grp_probe["refusal_score"].mean()) if len(grp_probe) > 0 else np.nan
+
+        # Refusal drop max (Section 3): max(baseline - min_refusal_across_alphas)
+        all_alpha_means = df_feat.groupby("alpha")["refusal_score"].mean()
+        min_refusal = float(all_alpha_means.min()) if len(all_alpha_means) > 0 else np.nan
+        refusal_drop_max = base_refusal_rate - min_refusal if not np.isnan(min_refusal) else np.nan
+
+        # Best alpha = the alpha with lowest mean refusal
+        if len(all_alpha_means) > 0:
+            best_alpha_val = float(all_alpha_means.idxmin())
+            best_refusal_val = float(all_alpha_means.min())
+        else:
+            best_alpha_val = np.nan
+            best_refusal_val = np.nan
+
+        # Threshold-independent effect size: min refusal rate and its alpha
+        # (same values as best_*, but named explicitly for clarity)
+        min_refusal_rate = best_refusal_val
+        alpha_at_min_refusal = best_alpha_val
+
+        # Steering diagnostics (Section 7)
+        steer_dir_feat = W_dec[fid].to(device=device, dtype=torch.float32)
+        feat_decoder_norm = float(steer_dir_feat.norm().item())
+
+        # Determine steering direction
+        if not censored_up and not censored_down:
+            steering_dir = "up" if alpha_star_up <= abs(alpha_star_down) else "down"
+        elif not censored_up:
+            steering_dir = "up"
+        elif not censored_down:
+            steering_dir = "down"
+        else:
+            steering_dir = "none"
+
         row = {
             "feature_id": fid,
             "base_refusal_rate": base_refusal_rate,
             "refusal_rate_at_max_alpha": refusal_rate_at_max,
             "refusal_drop_at_max_alpha": base_refusal_rate - refusal_rate_at_max if not np.isnan(refusal_rate_at_max) else np.nan,
+            "refusal_rate_alpha_1": refusal_at_alpha.get(1, np.nan),
+            "refusal_rate_alpha_5": refusal_at_alpha.get(5, np.nan),
+            "refusal_rate_alpha_20": refusal_at_alpha.get(20, np.nan),
+            "refusal_drop_max": refusal_drop_max,
+            "refusal_drop_alpha_5": base_refusal_rate - refusal_at_alpha.get(5, np.nan) if not np.isnan(refusal_at_alpha.get(5, np.nan)) else np.nan,
+            "best_alpha": best_alpha_val,
+            "best_refusal_rate": best_refusal_val,
+            "min_refusal_rate": min_refusal_rate,
+            "alpha_at_min_refusal": alpha_at_min_refusal,
             "alpha_star_feature_up": alpha_star_up,
             "alpha_star_feature_down": alpha_star_down,
             "censored_up": censored_up,
             "censored_down": censored_down,
+            "steering_direction": steering_dir,
+            # Geometry / diagnostics (Sections 5, 7)
+            "decoder_vector_norm": feat_decoder_norm,
+            "feature_l2_norm": feat_decoder_norm,
+            "steering_vector_norm": feat_decoder_norm,
         }
         summary_rows.append(row)
 
@@ -1094,6 +1467,125 @@ def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_col
         print(feat_summary.sort_values(existing_sort, ascending=True).head(15))
     else:
         print(feat_summary.head(15))
+
+    # ==================================================================
+    # W&B Logging (Sections 3–12 of instrumentation spec)
+    # ==================================================================
+
+    # --- Section 3: Run-Level Metrics ---
+    run_metrics = {"n_features": len(feat_summary), "n_rows": n_rows}
+
+    if "base_refusal_rate" in feat_summary.columns:
+        run_metrics["baseline_refusal_rate"] = float(feat_summary["base_refusal_rate"].mean())
+
+    for a_key, col in [(1, "refusal_rate_alpha_1"), (5, "refusal_rate_alpha_5"), (20, "refusal_rate_alpha_20")]:
+        if col in feat_summary.columns:
+            vals = feat_summary[col].dropna()
+            if len(vals) > 0:
+                run_metrics[f"mean_refusal_alpha_{a_key}"] = float(vals.mean())
+
+    if "refusal_drop_max" in feat_summary.columns:
+        drops = feat_summary["refusal_drop_max"].dropna()
+        if len(drops) > 0:
+            run_metrics["max_refusal_drop"] = float(drops.max())
+            run_metrics["mean_refusal_drop"] = float(drops.mean())
+            run_metrics["median_refusal_drop"] = float(drops.median())
+
+    if "alpha_star_feature_up" in feat_summary.columns:
+        uncensored_up = feat_summary[~feat_summary.get("censored_up", pd.Series(True)).astype(bool)]
+        n_uncensored_up = len(uncensored_up)
+        run_metrics["frac_uncensored_up"] = n_uncensored_up / max(1, len(feat_summary))
+        if n_uncensored_up > 0:
+            vals = uncensored_up["alpha_star_feature_up"].dropna()
+            run_metrics["mean_alpha_star_up"] = float(vals.mean())
+            run_metrics["median_alpha_star_up"] = float(vals.median())
+            run_metrics["std_alpha_star_up"] = float(vals.std())
+
+    if "alpha_star_feature_down" in feat_summary.columns:
+        uncensored_down = feat_summary[~feat_summary.get("censored_down", pd.Series(True)).astype(bool)]
+        run_metrics["frac_uncensored_down"] = len(uncensored_down) / max(1, len(feat_summary))
+        if len(uncensored_down) > 0:
+            vals_dn = uncensored_down["alpha_star_feature_down"].dropna()
+            if len(vals_dn) > 0:
+                run_metrics["mean_alpha_star_down"] = float(vals_dn.mean())
+                run_metrics["median_alpha_star_down"] = float(vals_dn.median())
+                run_metrics["std_alpha_star_down"] = float(vals_dn.std())
+
+    if "best_alpha" in feat_summary.columns:
+        run_metrics["best_alpha"] = float(feat_summary["best_alpha"].dropna().mode().iloc[0]) if len(feat_summary["best_alpha"].dropna()) > 0 else np.nan
+    if "best_refusal_rate" in feat_summary.columns:
+        run_metrics["best_refusal_rate"] = float(feat_summary["best_refusal_rate"].dropna().min()) if len(feat_summary["best_refusal_rate"].dropna()) > 0 else np.nan
+
+    if "min_refusal_rate" in feat_summary.columns:
+        mr = feat_summary["min_refusal_rate"].dropna()
+        if len(mr) > 0:
+            run_metrics["mean_min_refusal_rate"] = float(mr.mean())
+            run_metrics["median_min_refusal_rate"] = float(mr.median())
+
+    wandb.log(run_metrics)
+
+    # --- Section 4 + 5 + 6 + 7: feature_metrics Table ---
+    fm_cols = [c for c in [
+        "feature_id", "alpha_star_feature_up", "alpha_star_feature_down",
+        "censored_up", "censored_down", "steering_direction",
+        "base_refusal_rate",
+        "refusal_rate_alpha_1", "refusal_rate_alpha_5", "refusal_rate_alpha_20",
+        "refusal_drop_max", "refusal_drop_alpha_5",
+        "best_alpha", "best_refusal_rate",
+        "min_refusal_rate", "alpha_at_min_refusal",
+        # Geometry (Section 5)
+        "decoder_vector_norm", "feature_l2_norm",
+        # Steering diagnostics (Section 7)
+        "steering_vector_norm",
+        # Logit-mode extras
+        "tv_mean", "kl_mean", "maxabs_mean", "jacc_mean",
+        "target_delta_mean", "top1_rate_up", "mean_rank_improve",
+        "success_rate_up", "success_rate_down",
+    ] if c in feat_summary.columns]
+
+    feature_metrics_table = wandb.Table(dataframe=feat_summary[fm_cols])
+    wandb.log({"feature_metrics": feature_metrics_table})
+
+    # --- Section 8: feature_curves Table ---
+    curves_df = pd.DataFrame(curve_rows)
+    curve_table_cols = [c for c in [
+        "feature_id", "alpha",
+        "mean_refusal", "std_refusal",
+        "mean_delta", "std_delta",
+        "n_prompts",
+    ] if c in curves_df.columns]
+    feature_curves_table = wandb.Table(dataframe=curves_df[curve_table_cols])
+    wandb.log({"feature_curves": feature_curves_table})
+
+    # --- Section 9: prompt_results Table ---
+    # Read full run_rows and log as table (truncated to avoid OOM)
+    full_df = pd.read_csv(run_csv)
+    pr_cols = [c for c in [
+        "prompt_idx", "feature_id", "alpha",
+        "base_refusal", "refusal_score", "delta_refusal",
+        "gen_text",
+        "delta_logit_target", "tv_distance", "kl_base_to_steer",
+        "hook_ran",
+        "steering_vector_norm", "scaled_vector_norm",
+    ] if c in full_df.columns]
+    # Cap at 10k rows for the table to avoid W&B limits
+    prompt_results_table = wandb.Table(dataframe=full_df[pr_cols].head(10000))
+    wandb.log({"prompt_results": prompt_results_table})
+
+    # --- Section 12: Artifacts ---
+    artifact = wandb.Artifact(
+        name=f"phase2_run_{args.mode}",
+        type="run_outputs",
+        metadata={"n_rows": n_rows, "threshold_T": threshold_T},
+    )
+    for fpath in [run_csv, summary_path, alpha_star_path, curves_path,
+                  selected_features_path, os.path.join(args.out_dir, "meta.json")]:
+        fpath_str = str(fpath)
+        if os.path.exists(fpath_str):
+            artifact.add_file(fpath_str)
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any, Dict
 import logging
 
+from dotenv import load_dotenv
+
+# Load .env from project root (finds closest .env walking up from cwd)
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 

@@ -15,8 +15,8 @@ experiment:
 
 model:
   model_id: "gpt2"  # Override in target configs
-  device: "cuda"    # Use "cpu" only for smoke tests
-  dtype: "float32"
+  device: "auto"    # Auto-detects MPS > CUDA > CPU; override with "cpu" for smoke tests
+  dtype: "bfloat16"
   max_new_tokens: 64
   temperature: 0.0
   do_sample: false

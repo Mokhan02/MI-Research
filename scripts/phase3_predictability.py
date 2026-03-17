@@ -58,6 +58,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 from tqdm.auto import tqdm
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -131,39 +135,93 @@ def make_y_labels(summary: pd.DataFrame) -> pd.DataFrame:
 # ===================================================================
 
 def compute_geometry_chunked(W_dec: np.ndarray, tau: float, topk: int = 50,
-                             chunk_size: int = 256) -> dict:
+                             chunk_size: int = 256, device: str = "auto") -> dict:
     """W_dec: (n_feats, d_model).
-    Returns max_cosine_similarity, neighbor_density, density_tau per feature."""
-    n_feats, d_model = W_dec.shape
-    Wn = W_dec / (np.linalg.norm(W_dec, axis=1, keepdims=True) + 1e-12)
+    Returns max_cosine_similarity, neighbor_density, density_tau per feature.
 
-    max_cosine = np.full(n_feats, -np.inf, dtype=np.float32)
-    count_ge_tau = np.zeros(n_feats, dtype=np.float32)
-    sum_topk = np.zeros(n_feats, dtype=np.float32)
-    count_topk = np.zeros(n_feats, dtype=np.float32)
+    Uses PyTorch on GPU when available for a large speedup (~100x vs NumPy
+    for a 16k-feature SAE).  Falls back to NumPy transparently on CPU-only
+    machines.
+    """
+    # ---- resolve device ----
+    if device == "auto":
+        _dev = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        _dev = device
 
-    for i0 in tqdm(range(0, n_feats, chunk_size), desc="Geometry chunks"):
-        i1 = min(i0 + chunk_size, n_feats)
-        block = Wn[i0:i1]
-        S = block @ Wn.T
-        for j in range(i1 - i0):
-            S[j, i0 + j] = -np.inf
+    n_feats = W_dec.shape[0]
 
-        for j in range(i1 - i0):
-            row = S[j]
-            max_cosine[i0 + j] = float(np.max(row))
-            count_ge_tau[i0 + j] = float(np.sum(row >= tau))
-            top_vals = np.sort(row)[::-1][:topk]
-            valid = top_vals > -np.inf
-            if np.any(valid):
-                sum_topk[i0 + j] = np.sum(top_vals[valid])
-                count_topk[i0 + j] = np.sum(valid)
+    if _dev == "cuda":
+        # ---- GPU path (PyTorch) ----
+        logger.info("compute_geometry_chunked: using GPU (%s), n_feats=%d", _dev, n_feats)
+        Wt = torch.from_numpy(W_dec).float().to(_dev)  # (n_feats, d_model)
+        norms = Wt.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        Wn = Wt / norms  # (n_feats, d_model) — unit vectors
 
-    density_tau = count_ge_tau / max(1, n_feats - 1)
-    mean_topk_cos = np.where(count_topk > 0, sum_topk / count_topk, np.nan)
+        max_cosine = torch.full((n_feats,), -torch.inf, device=_dev)
+        count_ge_tau = torch.zeros(n_feats, device=_dev)
+        sum_topk = torch.zeros(n_feats, device=_dev)
+        count_topk = torch.zeros(n_feats, device=_dev)
+
+        for i0 in tqdm(range(0, n_feats, chunk_size), desc="Geometry chunks (GPU)"):
+            i1 = min(i0 + chunk_size, n_feats)
+            block = Wn[i0:i1]            # (chunk, d_model)
+            S = block @ Wn.T             # (chunk, n_feats)
+            # Mask self-similarities
+            for j in range(i1 - i0):
+                S[j, i0 + j] = -torch.inf
+
+            chunk_max, _ = S.max(dim=1)
+            max_cosine[i0:i1] = chunk_max
+
+            count_ge_tau[i0:i1] = (S >= tau).float().sum(dim=1)
+
+            # top-k mean (excluding -inf self entries are already -inf ranked last)
+            k = min(topk, n_feats - 1)
+            topk_vals, _ = torch.topk(S, k=k, dim=1)  # (chunk, k)
+            valid_mask = topk_vals > -torch.inf        # (chunk, k)
+            valid_sums = (topk_vals * valid_mask.float()).sum(dim=1)
+            valid_counts = valid_mask.float().sum(dim=1)
+            sum_topk[i0:i1] = valid_sums
+            count_topk[i0:i1] = valid_counts
+
+        density_tau = (count_ge_tau / max(1, n_feats - 1)).cpu().numpy().astype(np.float32)
+        mean_topk_cos = torch.where(
+            count_topk > 0, sum_topk / count_topk, torch.full_like(sum_topk, float("nan"))
+        ).cpu().numpy().astype(np.float32)
+        max_cosine_np = max_cosine.cpu().numpy().astype(np.float32)
+
+    else:
+        # ---- CPU fallback (NumPy) — original implementation ----
+        logger.info("compute_geometry_chunked: using CPU/NumPy, n_feats=%d", n_feats)
+        Wn = W_dec / (np.linalg.norm(W_dec, axis=1, keepdims=True) + 1e-12)
+
+        max_cosine_np = np.full(n_feats, -np.inf, dtype=np.float32)
+        count_ge_tau = np.zeros(n_feats, dtype=np.float32)
+        sum_topk = np.zeros(n_feats, dtype=np.float32)
+        count_topk = np.zeros(n_feats, dtype=np.float32)
+
+        for i0 in tqdm(range(0, n_feats, chunk_size), desc="Geometry chunks"):
+            i1 = min(i0 + chunk_size, n_feats)
+            block = Wn[i0:i1]
+            S = block @ Wn.T
+            for j in range(i1 - i0):
+                S[j, i0 + j] = -np.inf
+            for j in range(i1 - i0):
+                row = S[j]
+                max_cosine_np[i0 + j] = float(np.max(row))
+                count_ge_tau[i0 + j] = float(np.sum(row >= tau))
+                top_vals = np.sort(row)[::-1][:topk]
+                valid = top_vals > -np.inf
+                if np.any(valid):
+                    sum_topk[i0 + j] = np.sum(top_vals[valid])
+                    count_topk[i0 + j] = np.sum(valid)
+
+        density_tau = count_ge_tau / max(1, n_feats - 1)
+        mean_topk_cos = np.where(count_topk > 0, sum_topk / count_topk, np.nan)
 
     return {
-        "max_cosine_similarity": max_cosine,
+        "max_cosine_similarity": max_cosine_np,
         "neighbor_density": mean_topk_cos,
         "density_tau": density_tau,
     }
@@ -737,6 +795,39 @@ def main():
     (output_dir / "plots").mkdir(parents=True, exist_ok=True)
     (output_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
+    # Initialize W&B (spec: sae-refusal-steering project)
+    try:
+        import subprocess as _sp
+        _git_hash = _sp.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=_sp.DEVNULL
+        ).decode().strip()
+    except Exception:
+        _git_hash = "unknown"
+
+    wandb.init(
+        project="sae-refusal-steering",
+        name=f"phase3_{args.run_name}",
+        tags=[
+            f"config_{Path(args.config).stem}",
+            "phase3_predictability",
+        ],
+        config={
+            # Ablation metadata (Section 10)
+            "experiment_type": "full_run",
+            "pipeline_version": "phase3_v2",
+            "git_commit": _git_hash,
+            "run_tag": f"phase3_{args.run_name}",
+
+            "phase": "phase3_predictability",
+            "n_bootstrap": args.n_bootstrap,
+            "tau": args.tau,
+            "topk": args.topk,
+            "run_name": args.run_name,
+            "input_csv": args.input_csv,
+            "phase2_dir": args.phase2_dir,
+        },
+    )
+
     # -----------------------------------------------------------------
     # MODE A: Load pre-merged CSV (analysis only)
     # -----------------------------------------------------------------
@@ -946,6 +1037,50 @@ def main():
     top10 = merge.sort_values("alpha_star_best").head(10)
     print(top10[show_cols].to_string(index=False))
 
+    # ==================================================================
+    # W&B Logging
+    # ==================================================================
+
+    # Correlation results as metrics
+    corr_csv = output_dir / "outputs" / "correlation_results.csv"
+    if corr_csv.exists():
+        corr_df = pd.read_csv(corr_csv)
+        corr_metrics = {}
+        for _, row in corr_df.iterrows():
+            m = row["metric"]
+            corr_metrics[f"spearman_r_full/{m}"] = row["r_full"]
+            corr_metrics[f"spearman_p_full/{m}"] = row["p_full"]
+            corr_metrics[f"spearman_r_nocens/{m}"] = row.get("r_nocensored", float("nan"))
+        wandb.log(corr_metrics)
+
+    # Feature metrics table (geometry + steerability)
+    table_cols = ["feature_id", "alpha_star_best", "is_censored", "log_alpha_star"]
+    table_cols += [m for m in GEOMETRY_METRICS if m in merge.columns]
+    for extra in ["act_freq", "mean_act", "density_tau"]:
+        if extra in merge.columns:
+            table_cols.append(extra)
+    feature_table = wandb.Table(dataframe=merge[table_cols].copy())
+    wandb.log({"feature_metrics": feature_table})
+
+    # Scatter plots as images
+    for png in (output_dir / "plots").glob("*.png"):
+        wandb.log({png.stem: wandb.Image(str(png))})
+
+    # Artifacts
+    artifact = wandb.Artifact(
+        name=f"phase3_{args.run_name}",
+        type="analysis_outputs",
+        metadata={"n_features": len(merge), "n_bootstrap": args.n_bootstrap},
+    )
+    for fpath in [corr_csv, output_dir / "outputs" / "summary_stats.csv",
+                  output_dir / "outputs" / "classification_supplementary.csv"]:
+        if fpath.exists():
+            artifact.add_file(str(fpath))
+    for png in (output_dir / "plots").glob("*.png"):
+        artifact.add_file(str(png))
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
     logger.info("Phase 3 analysis complete. Outputs in %s", output_dir)
 
 

@@ -8,246 +8,172 @@ Feature steering with SAEs is increasingly used for model control and alignment,
 
 The core thesis: features that are densely clustered in representation space or highly co-activated with neighboring features are more entangled, require larger steering coefficients to induce targeted effects, and cause greater collateral behavioral changes when forced.
 
-## Quick Overview
-
-The pipeline has five phases:
-
-| Phase | Question | Script |
-|-------|----------|--------|
-| 1 | What are the geometric and usage properties of each feature? | `pipeline/phase1_feature_metrics.py` |
-| 2 | What steering coefficient does each feature require? | `pipeline/phase2_steerability.py` |
-| 3 | Do pre-steering metrics predict steerability? | `pipeline/phase3_prediction.py` |
-| 4 | What off-target effects does steering induce? | `pipeline/phase4_off_target.py` |
-| 5 | Can we derive safe steering rules? | `pipeline/phase5_safe_rules.py` |
-
-## Setup
+## Quick Start
 
 ### Prerequisites
 
-- Python 3.10+
-- CUDA-compatible GPU (recommended)
+- Python 3.11–3.12
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- GPU recommended (MPS on Apple Silicon, CUDA on Linux/Windows) — CPU works but is slow
+- HuggingFace token for gated model access
+- [Weights & Biases](https://wandb.ai/) account for experiment tracking
 
 ### Installation
+
 ```bash
-# Core dependencies
-pip install torch transformers accelerate
-
-# Data and analysis
-pip install pandas numpy scipy statsmodels scikit-learn pyarrow
-
-# Visualization and utilities
-pip install matplotlib tqdm pyyaml
-
-# HuggingFace tooling
-pip install --upgrade huggingface_hub
-
-# Image support
-pip install --upgrade Pillow
-
-# NumPy 2.x compatibility fix (required)
-pip install "numpy<2"
+uv sync
 ```
 
-If you see torchvision CUDA errors, run:
+`.env` should contain:
+
+```
+WANDB_API_KEY=your_wandb_key
+HF_TOKEN=your_hf_token
+```
+
+These are loaded automatically by all scripts (via `python-dotenv`). You do **not** need to `export` them manually.
+
+### Run the pipeline
+
 ```bash
-pip install --force-reinstall torchvision --index-url https://download.pytorch.org/whl/cu121
+# 1. Contrast feature selection (real model + SAE)
+uv run python scripts/phase2_select_contrast.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --domain planets --out_dir outputs/phase2_select --top-k 100
+
+# 2. Measure steerability (real SAE, matched features + prompts)
+uv run python scripts/phase2_run.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --out_dir outputs/phase2 --n_prompts 100 \
+  --fixed_features_path outputs/phase2_select/selected_features_planets.json
+
+# 3. Predict α* from geometry
+uv run python scripts/phase3_predictability.py \
+  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+  --phase2_dir outputs/phase2 --out_dir outputs/phase3
 ```
 
-### Credentials
+Results land in `outputs/phase2_select/` (feature summaries), `outputs/phase2/` (run_rows.csv, alpha_star.csv, curves), and `outputs/phase3/` (correlation results, scatter plots).
 
-Add your HuggingFace token to the environment:
-```bash
-export HF_TOKEN=your_token_here
-```
+### Device selection
 
-Or create a `.env` file:
-```
-HF_TOKEN=your_token_here
-```
+All configs default to `device: "auto"`, which picks the best available backend:
 
-## Experimental Pipeline
+1. **MPS** (Apple Silicon) — used automatically on macOS with M-series chips
+2. **CUDA** — used automatically when an NVIDIA GPU is available
+3. **CPU** — fallback
+
+Override in config YAML or pass `--device cpu` where supported.
+
+## Pipeline
+
+| Phase | Question | Script |
+|-------|----------|--------|
+| 1 | Select features by contrast (task − neutral) | `scripts/phase2_select_contrast.py` |
+| 2 | What steering coefficient does each feature require? | `scripts/phase2_run.py` |
+| 3 | Do pre-steering metrics predict steerability? | `scripts/phase3_predictability.py` |
+| 4 | What off-target effects does steering induce? | *(not yet implemented)* |
+
+**Do not run scripts in `scripts/legacy/`.** They are the old pipeline with fake SAE/steering/scores, kept only for reference.
 
 ### Models and SAE
 
-The pipeline operates on a single model × layer × feature set (MVP):
+| Component | Value |
+|-----------|-------|
+| Model | `google/gemma-2-2b-it` (instruction-tuned) or `google/gemma-2-2b` (base) |
+| SAE | GemmaScope res-16k, layer 20 (`google/gemma-scope-2b-pt-res`) |
+| Hook point | `blocks.20.hook_resid_post` (TransformerLens-style → `model.layers.20`) |
+| Features | 16,384 total; 300 selected by contrast; τ_act=2.0, token_span=last_n (n=8) |
+| Benchmark | SALADBench (refusal), 100 prompts |
+| Steering grid | α ∈ {0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0} |
+| Threshold | T = 0.10 (minimum Δrefusal for α*) |
 
-| Component | Role |
-|-----------|------|
-| Base model | The LLM being analyzed (TBD) |
-| SAE checkpoint | Sparse autoencoder trained on the chosen layer (TBD) |
-| Intervention layer | Single transformer layer for MVP (TBD) |
-| Feature set | N = 200–500 SAE features, stratified by activation frequency |
+### Phase 1: Feature Selection (`phase2_select_contrast.py`)
 
-### Datasets
+Contrast-based: top K by Δ = act_freq_task − act_freq_neutral. Uses real model + SAE decoder. Outputs `selected_features_<domain>.json` and `feature_summary_<domain>.csv`.
 
-Three prompt sets are used across phases:
+### Phase 2: Measuring Steerability (`phase2_run.py`)
 
-| Dataset | Purpose | Size |
-|---------|---------|------|
-| Reference corpus | Phase 1: compute geometry and usage statistics | 50k–200k tokens |
-| On-target benchmark | Phase 2: measure behavioral change under steering | 300–1,000 prompts |
-| Off-target benchmarks | Phase 4: measure collateral behavioral effects | 100–300 prompts each |
+Steering is applied as: `h' = h + α · v_f`
 
-**On-target benchmark options (choose one for MVP):**
-- SALADBench — refusal behavior
-- BBQ / ToxiGen — bias
-- HalluLens — hallucination
+where `v_f` is the SAE decoder direction and `α` sweeps the grid. **Steerability** `α*(f)` = min α where Δrefusal ≥ T. Features that never reach T are right-censored.
 
-**Off-target benchmarks:**
-- GPQA — reasoning
-- TruthfulQA — truthfulness
-- DarkBench — sycophancy
+Outputs: `run_rows.csv`, `alpha_star.csv`, `curves_per_feature.parquet`.
 
----
+### Phase 3: Predicting Steerability (`phase3_predictability.py`)
 
-## Pipeline Details
+Computes pre-steering geometric metrics (max cosine similarity, neighborhood density, co-activation correlation) and correlates them with log(α*) via Spearman rank correlation and regression.
 
-### Phase 1: Pre-Steering Feature Characterization
+### Phase 4: Off-Target Analysis
 
-For each SAE feature `f`, three geometric and usage metrics are computed on a reference corpus *before any steering intervention*:
+To be implemented. Will measure collateral behavioral effects at α*(f) and at fixed low α₀.
 
-| Metric | Definition | What it captures |
-|--------|-----------|-----------------|
-| Max cosine similarity | `max_{g≠f} cos(v_f, v_g)` | Proximity to nearest neighbor in decoder space |
-| Neighborhood density | Mean cosine similarity to k-NN (default k=50) | Local crowding in representation space |
-| Co-activation correlation | Mean activation correlation with top-k co-active features | Functional entanglement across the corpus |
+## Experiment Tracking (W&B)
 
-Optional add-ons: activation frequency, mean activation, sparsity.
+All pipeline scripts log to the `sae-refusal-steering` Weights & Biases project. Each run logs full config, tables, and artifacts per the instrumentation spec.
 
-These metrics are computed once and remain fixed throughout the study.
+| Script | Run Name | Tables | Key Metrics |
+|--------|----------|--------|-------------|
+| `phase2_select_contrast.py` | `phase2_select_{domain}` | `feature_metrics` | delta_freq stats, decoder norms |
+| `phase2_run.py` | `phase2_run_{mode}` | `feature_metrics`, `feature_curves`, `prompt_results` | baseline_refusal_rate, refusal_drop_max, alpha_star, steering diagnostics |
+| `phase3_predictability.py` | `phase3_{run_name}` | `feature_metrics` | Spearman correlations, scatter plots |
 
-### Phase 2: Measuring Steerability
+Every run is tagged with model, layer, steering method, feature selection method, and experiment type for easy filtering. Artifacts (CSVs, Parquet, JSONs) are uploaded via `wandb.Artifact`.
 
-Steering is applied as:
-```
-h' = h + α · v_f
-```
+Runs appear at `wandb.ai/<your-entity>/sae-refusal-steering`. Set `WANDB_MODE=disabled` in `.env` to skip logging.
 
-where `v_f` is the decoder direction of feature `f` and `α` is a steering coefficient drawn from a log-spaced grid:
-```
-α ∈ {0.1, 0.2, 0.5, 1, 2, 5, 10}
-```
+## Configuration
 
-**Steerability** `α*(f)` is defined as the minimum coefficient required to induce a fixed behavioral delta `T` (e.g., T = 0.10 absolute improvement) relative to the unsteered baseline:
-```
-α*(f) = min{α : B(α, f) − B(0) ≥ T}
-```
+Configs live in `configs/`. The target configs inherit from `configs/base.yaml`:
 
-Features that do not reach the threshold within the tested range are right-censored: `α*(f) > 10`.
+- `configs/targets/gemma2_2b_gemmascope_res16k.yaml` — Gemma-2-2b-IT (main)
+- `configs/targets/gemma2_2b_base_gemmascope_res16k.yaml` — Gemma-2-2b base
 
-### Phase 3: Predicting Steerability (Primary Analysis)
+## Run Gates
 
-Tests whether pre-steering metrics predict `log α*(f)` using:
-- Spearman rank correlations between each metric and `log α*(f)`
-- Regression and classification models trained on pre-steering metrics only
-- Cross-validation across features
-- Permutation-based null baselines and single-metric ablations
+See **GATES.md** for the seven gates before a full run. Key points:
 
-**Key outputs:** scatter plots (metric vs. `log α*(f)`), predicted vs. actual plots, AUROC for steerability classification.
+1. Domain prompt splits — no overlap between selection and evaluation
+2. Contrast-based selection — top K by Δ, not top K act_freq
+3. Micro sweep first — `phase2_run --micro_sweep` (10 features, ~25 prompts) before full K=100
+4. α* with censoring — never set α* = max for no-effect features
 
-### Phase 4: Off-Target Behavioral Analysis (Secondary Analysis)
+See **LANDMINES.md** for six traps to audit (tau_act, token_span, T pre-registration, directionality, control matching, neutral isomorphism).
 
-Off-target effects are measured under two regimes:
+## Key Files
 
-1. **At `α*(f)`** — collateral effects at the minimum coefficient needed for the target behavior
-2. **At a fixed low `α₀`** (e.g., `α₀ = 1`) — isolates structurally risky features independent of intervention strength
-
-For each off-target benchmark `U_j`, two quantities are computed:
-
-| Metric | Formula | What it captures |
-|--------|---------|-----------------|
-| Magnitude | `(1/m) Σ_j |ΔU_j(α, f)|` | Average severity of collateral changes |
-| Breadth | `(1/m) Σ_j 1{|ΔU_j(α, f)| > τ}` | Number of behaviors meaningfully affected |
-
-### Phase 5: Safe Steering Rules
-
-Derives principled guidelines for safe coefficient selection based on the relationship between pre-steering geometry and observed off-target risk across Phases 2–4.
-
----
-
-## Baselines and Controls
-
-| Baseline | Purpose |
-|----------|---------|
-| Permutation test | Shuffle metric–feature assignments; expected predictive performance under null |
-| Single-metric ablations | Quantify individual contribution of each pre-steering metric |
-| Random direction control | Steer along random vectors matched in norm to `v_f`; tests whether any direction causes effects |
-| Second model / layer (stretch) | Generalization beyond the MVP model and layer |
-
----
-
-## Statistical Methods
-
-- **Primary target:** predict `log α*(f)` (regression) and `α*(f) ≤ α_max` (classification)
-- **Metrics:** Spearman ρ, R² on `log α*`, AUROC for classification
-- **Uncertainty:** bootstrap confidence intervals over features; permutation-based p-values for key correlations
-
----
-
-## Output Structure
-
-All results are saved under `outputs/`:
-```
-outputs/
-  phase1_metrics/
-    feature_metrics.csv          # Per-feature geometry and usage stats
-    metric_distributions.png     # Histograms of each metric across features
-
-  phase2_steerability/
-    steerability_scores.csv      # α*(f) per feature, with censoring flags
-    steering_curves.png          # On-target score vs. α for sampled features
-
-  phase3_prediction/
-    correlation_results.csv      # Spearman ρ and p-values per metric
-    regression_cv_results.csv    # Cross-validated regression performance
-    scatter_plots/               # Metric vs. log α*(f) per metric
-    predicted_vs_actual.png      # CV predictions vs. ground truth
-
-  phase4_off_target/
-    off_target_at_threshold.csv  # Magnitude and breadth at α*(f)
-    off_target_at_fixed_alpha.csv
-    risk_vs_steerability.png     # Off-target risk vs. α*(f) scatter
-
-  phase5_safe_rules/
-    safe_steering_guidelines.md  # Derived coefficient recommendations
-```
-
----
+| File | Purpose |
+|------|---------|
+| `src/model_utils.py` | Model loading with auto device detection (MPS/CUDA/CPU) |
+| `src/sae_loader.py` | Real SAE decoder loading (`load_gemmascope_decoder`) |
+| `src/hook_resolver.py` | TransformerLens ↔ HuggingFace hook name mapping |
+| `src/refusal_scorer.py` | Keyword-based refusal classifier |
+| `src/config.py` | Config loading and validation |
 
 ## Hypotheses
 
-| Hypothesis | Prediction | What would confirm it |
-|------------|-----------|----------------------|
-| Geometry predicts steerability | Features with higher neighbor density and co-activation require larger `α*` | Significant positive Spearman ρ between density/co-activation and `log α*(f)` |
-| Entangled features cause more collateral effects | Features with high pre-steering entanglement show higher off-target magnitude and breadth | Strong correlation between geometric metrics and off-target risk |
-| Steerability and off-target risk are related but distinct | Harder-to-steer features are riskier, but some features are risky even at low `α` | Risk vs. `α*(f)` shows a positive trend with meaningful residuals |
-
----
+| Hypothesis | What would confirm it |
+|------------|----------------------|
+| Geometry predicts steerability | Significant positive Spearman ρ between density/co-activation and log α*(f) |
+| Entangled features cause more collateral effects | Strong correlation between geometric metrics and off-target risk |
+| Steerability and off-target risk are related but distinct | Risk vs. α*(f) shows positive trend with meaningful residuals |
 
 ## Limitations
 
-- **Computational cost.** Running multiple benchmarks across a grid of coefficients for hundreds of features is expensive. This limits the number of features, layers, and models that can be studied in a single sweep.
-- **Single model and layer.** The MVP focuses on one model and one intervention layer. The relationship between feature geometry and steerability may differ across architectures or depths.
-- **Behavior-specific thresholds.** Steerability is defined relative to a fixed behavioral delta `T`. What counts as a "meaningful" change differs across benchmarks (e.g., a 0.1 improvement on refusal is not equivalent to 0.1 on bias), so comparisons across on-target behaviors require care.
-- **Generalization.** It is unclear whether features found to be predictable in one setting will behave similarly in another. Stretch experiments on a second model or layer are included to probe this.
-
----
+- **Computational cost** — multiple benchmarks × coefficient grid × hundreds of features is expensive
+- **Single model and layer** — MVP focuses on Gemma-2-2b layer 20; may not generalize
+- **Behavior-specific thresholds** — T = 0.10 on refusal ≠ 0.10 on bias
+- **Generalization** — unclear if results transfer across architectures or depths
 
 ## Related Work
 
-| Paper | Key Finding | Gap Addressed |
-|-------|------------|---------------|
-| [SAEs Are Good for Steering](https://arxiv.org/abs/2505.20063) | Steering is more effective on causally influential features | No pre-intervention predictor of difficulty or risk |
-| [Entanglement and the CACE Principle](https://medium.com/@ib.lahlou) | Interventions on entangled representations cause widespread changes | No concrete, testable framework for predicting steering risk |
-| [Geometry of Categorical Concepts in LLMs](https://arxiv.org/abs/2406.01506) | Clean concept geometry corresponds to better semantic alignment | Geometry studied at concept level, not linked to steering |
-| [Evaluating Feature Steering](https://www.anthropic.com) | Features respond very differently to steering strength | Analysis is retrospective, no pre-steering predictive framework |
-
----
+| Paper | Key Finding |
+|-------|------------|
+| [SAEs Are Good for Steering](https://arxiv.org/abs/2505.20063) | Steering is more effective on causally influential features |
+| [Geometry of Categorical Concepts in LLMs](https://arxiv.org/abs/2406.01506) | Clean concept geometry corresponds to better semantic alignment |
 
 ## Team
 
 Girish, Akshaj, Mo, Aashna, Shlok
 
-Research doc: https://docs.google.com/document/d/1c-gnQnJlBCQvK3M607sx0QAn8XebIgnVtDrnkB0pQQ0/edit?tab=t.itpz4hcr2hqi#heading=h.4uarl9d0uyvr
-
-
+[Research doc](https://docs.google.com/document/d/1c-gnQnJlBCQvK3M607sx0QAn8XebIgnVtDrnkB0pQQ0/edit?tab=t.itpz4hcr2hqi#heading=h.4uarl9d0uyvr)

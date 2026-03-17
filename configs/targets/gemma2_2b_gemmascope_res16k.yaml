@@ -6,7 +6,7 @@
 
 model:
   model_id: "google/gemma-2-2b-it"
-  device: "cuda"  # Use GPU for real experiments
+  device: "auto"  # Auto-detects MPS > CUDA > CPU
   dtype: "bfloat16"  # Use bfloat16 for memory efficiency on A10
   max_new_tokens: 64
   temperature: 0.0
