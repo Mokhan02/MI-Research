@@ -1,0 +1,63 @@
+# Ablation: Gemma-2-2b-IT at LATER LAYER 24 (16K SAE)
+#
+# Near-final layers for comparison. If layer 24 steers better than 20,
+# this strengthens the "later = more steerable" hypothesis.
+#
+# weights_path verified on HuggingFace (google/gemma-scope-2b-pt-res).
+# Layer 24 width_16k offers: average_l0_20, 38, 73, 158, 457; we use 73 (close to layer 20's 71).
+
+model:
+  model_id: "google/gemma-2-2b-it"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_set: "gemmascope-res-16k"
+  sae_id: "24-gemmascope-res-16k"
+  layer_idx: 24
+  hook_point: "blocks.24.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "google/gemma-scope-2b-pt-res"
+  weights_path: "layer_24/width_16k/average_l0_73/params.npz"
+  n_features_total: 16384
+
+architecture:
+  d_model: 2304
+  n_layers: 26
+  vocab_size: 256000
+
+sae_specs:
+  decoder_shape: [16384, 2304]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features_l24.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+steering:
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "gemma2-2b-gemmascope-res16k-layer24"
+  seed: 42
+  phase: 2

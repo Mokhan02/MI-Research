@@ -1,0 +1,63 @@
+# Ablation: Gemma-2-2b-IT with WIDER GemmaScope SAE (65K features)
+#
+# Wider SAEs capture more monosemantic features and reduce feature-splitting,
+# which Arad et al. and the teammate PDF both recommend for stronger steering.
+#
+# weights_path verified on HuggingFace (google/gemma-scope-2b-pt-res).
+# Layer 20 width_65k offers: average_l0_20, 34, 61, 114, 221; we use 61.
+
+model:
+  model_id: "google/gemma-2-2b-it"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_set: "gemmascope-res-65k"
+  sae_id: "20-gemmascope-res-65k"
+  layer_idx: 20
+  hook_point: "blocks.20.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "google/gemma-scope-2b-pt-res"
+  weights_path: "layer_20/width_65k/average_l0_61/params.npz"
+  n_features_total: 65536
+
+architecture:
+  d_model: 2304
+  n_layers: 26
+  vocab_size: 256000
+
+sae_specs:
+  decoder_shape: [65536, 2304]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features_65k.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+steering:
+  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "gemma2-2b-gemmascope-res65k-layer20"
+  seed: 42
+  phase: 2
