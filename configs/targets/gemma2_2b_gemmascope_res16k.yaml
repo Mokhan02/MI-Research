@@ -26,16 +26,12 @@ sae:
 # Model architecture specs (verified for google/gemma-2-2b)
 architecture:
   d_model: 2304  # model.config.hidden_size for Gemma-2-2b
-  n_layers: 18  # TODO: Verify total number of layers in Gemma-2-2b
-  vocab_size: 256000  # TODO: Verify vocab size
+  n_layers: 26
+  vocab_size: 256000
 
 # SAE decoder weights specs
 sae_specs:
   decoder_shape: [16384, 2304]  # (n_features_total, d_model)
-  # TODO: Verify decoder weights are stored as:
-  # - .safetensors format?
-  # - Normalized already?
-  # - How to load from weights_repo?
 
 # Feature selection for this target
 features:
@@ -54,7 +50,7 @@ features:
 
 # On-target steering only
 steering:
-  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  alpha_grid: [0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
   threshold_T: 0.10
   alpha0: 1.0
   tau: 0.1

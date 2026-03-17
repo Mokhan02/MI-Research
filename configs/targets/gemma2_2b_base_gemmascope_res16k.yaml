@@ -25,7 +25,7 @@ sae:
 
 architecture:
   d_model: 2304
-  n_layers: 18
+  n_layers: 26
   vocab_size: 256000
 
 sae_specs:
