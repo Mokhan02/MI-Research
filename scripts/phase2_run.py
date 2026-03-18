@@ -1072,19 +1072,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     for fid, alpha in fa_pairs:
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
         steer_norm = float(steer_dir.norm().item())
-
-        if alpha == 0.0:
-            gen_text = br["base_text"]
-            hook_ran = True
-        else:
-            if sae_enc is not None:
-                mk_hook, cap = make_steer_prehook_amax_lastpos(
-                    model, args.layer, alpha, steer_dir,
-                    sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
-            else:
-                mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
-            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat)
-            hook_ran = cap["ok"]
+        # NOTE: Do not reference `br` here. `br` is only defined inside the
+        # per-prompt loop below (from `baseline_refusal[pi]`).
         for batch_start in range(0, len(prompt_indices), batch_size):
             batch_pis = prompt_indices[batch_start: batch_start + batch_size]
 
