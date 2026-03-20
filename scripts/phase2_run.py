@@ -209,16 +209,20 @@ def make_steer_prehook_amax_lastpos(model, layer_idx: int, alpha: float,
                                     steer_dir: torch.Tensor, W_enc: torch.Tensor,
                                     b_enc: torch.Tensor, threshold: torch.Tensor):
     """Activation-scaled steering at the last token only (for generation,
-    matching Arad et al.'s AmlifySAEHook which steers only [:, -1, :])."""
+    matching Arad et al.'s AmlifySAEHook which steers only [:, -1, :]).
+
+    Per batch row: each sequence gets its own a_max from its last-token residual.
+    """
     ran = {"ok": False}
     def _mk():
         def _prehook(module, inputs):
             hidden = inputs[0]  # (batch, seq, d_model)
             ran["ok"] = True
             hidden2 = hidden.clone()
-            resid = hidden2[0, -1, :].float()
-            a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
-            hidden2[0, -1, :] = hidden2[0, -1, :] + alpha * a_max * steer_dir
+            for b in range(hidden2.shape[0]):
+                resid = hidden2[b, -1, :].float()
+                a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+                hidden2[b, -1, :] = hidden2[b, -1, :] + alpha * a_max * steer_dir
             return (hidden2,) + inputs[1:]
         layer = model.model.layers[layer_idx]
         return layer.register_forward_pre_hook(_prehook)
@@ -261,9 +265,10 @@ def make_steer_prehook_multi_amax_lastpos(model, layer_idx: int, alpha: float,
             hidden = inputs[0]
             ran["ok"] = True
             hidden2 = hidden.clone()
-            resid = hidden2[0, -1, :].float()
-            a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
-            hidden2[0, -1, :] = hidden2[0, -1, :] + alpha * a_max * combined
+            for b in range(hidden2.shape[0]):
+                resid = hidden2[b, -1, :].float()
+                a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+                hidden2[b, -1, :] = hidden2[b, -1, :] + alpha * a_max * combined
             return (hidden2,) + inputs[1:]
         layer = model.model.layers[layer_idx]
         return layer.register_forward_pre_hook(_prehook)
@@ -686,7 +691,6 @@ def main():
 # Logit mode (factual QA: delta_logit_target)
 # ===========================================================
 def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc):
-# ======================================================def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
     device = next(model.parameters()).device
 
     lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
@@ -746,34 +750,6 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
         steer_norm = float(steer_dir.norm().item())
 
-        if alpha == 0.0:
-            steer_logits = pc["base_logits"]
-            steer_resid = pc["base_resid"]
-            hook_ran = True
-        else:
-            mk_hook, cap = make_steer_prehook_amax(
-                model, args.layer, alpha, pc["pos"], steer_dir,
-                sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
-            t0 = time.time()
-            steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
-            t1 = time.time()
-            hook_ran = cap["ok"]
-            if (t1 - t0) > 2.0:
-                print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
-
-        steer_t = torch.dot(steer_resid, pc["w_t"])
-        delta_target = float((steer_t - pc["base_t"]).item())
-
-        d = steer_logits - pc["base_logits"]
-        max_abs = float(d.abs().max().item())
-        tv = tv_distance_from_logits(pc["base_logits"], steer_logits)
-        kl = kl_pq_from_logits(pc["base_logits"], steer_logits)
-        jac = topk_jaccard(pc["base_logits"], steer_logits, k=args.topk)
-
-        tid = pc["target_id"]
-        base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
-        steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
-        target_is_top1 = bool(steer_rank == 1)
         # Split prompts into mini-batches
         for batch_start in range(0, len(prompt_indices), batch_size):
             batch_pis = prompt_indices[batch_start: batch_start + batch_size]
@@ -977,8 +953,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
       2. Score the response for refusal (keyword-based).
     alpha* = smallest |alpha| where refusal_rate drops below baseline by T.
 
-    When sae_enc is provided, uses activation-scaled steering (Arad et al.):
-    steers at the last token only per forward pass, with magnitude alpha * a_max.
+    Uses activation-scaled steering (Arad et al.): last token only per forward,
+    magnitude alpha * a_max * W_dec[f].
     """
     device = next(model.parameters()).device
     max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
