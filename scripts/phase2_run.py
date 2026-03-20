@@ -26,7 +26,7 @@ def _git_commit_hash() -> str:
 
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
-from src.sae_loader import load_gemmascope_decoder, load_gemmascope_full
+from src.sae_loader import load_gemmascope_full
 from src.refusal_scorer import refusal_score as _refusal_score
 
 # --------------------------
@@ -166,35 +166,6 @@ def generate_steered_batch(
         gen_ids = out_ids[i, prompt_lens:]
         results.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
     return results
-
-
-def make_steer_prehook_all_pos(model, layer_idx: int, alpha: float, steer_dir: torch.Tensor):
-    """Steering hook that adds alpha * steer_dir at ALL positions (needed for generation)."""
-    ran = {"ok": False}
-    def _mk():
-        def _prehook(module, inputs):
-            hidden = inputs[0]
-            ran["ok"] = True
-            hidden2 = hidden.clone()
-            hidden2[:, :, :] = hidden2[:, :, :] + alpha * steer_dir
-            return (hidden2,) + inputs[1:]
-        layer = model.model.layers[layer_idx]
-        return layer.register_forward_pre_hook(_prehook)
-    return _mk, ran
-
-
-def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir: torch.Tensor):
-    ran = {"ok": False}
-    def _mk():
-        def _prehook(module, inputs):
-            hidden = inputs[0]  # [1, seq, d_model]
-            ran["ok"] = True
-            hidden2 = hidden.clone()
-            hidden2[0, pos, :] = hidden2[0, pos, :] + alpha * steer_dir
-            return (hidden2,) + inputs[1:]
-        layer = model.model.layers[layer_idx]
-        return layer.register_forward_pre_hook(_prehook)
-    return _mk, ran
 
 
 # ------------------------------------------------------------------
@@ -518,9 +489,6 @@ def main():
     ap.add_argument("--resume", action="store_true", help="Skip tasks already in run_rows.csv")
     ap.add_argument("--micro_sweep", action="store_true",
                     help="Micro sweep: 10 features, 25 prompts, alpha=[0,.5,1,2,5]. Run this before full K=100.")
-    ap.add_argument("--legacy_steering", action="store_true",
-                    help="Use legacy fixed-vector steering (x += alpha * W_dec[i]) instead of "
-                         "activation-scaled steering (x += alpha * a_max * W_dec[i]).")
     ap.add_argument("--multi_steer_top_n", type=int, default=None,
                     help="Multi-feature steering: steer with the top N features simultaneously "
                          "(sum of decoder directions). When set, runs a single combined-feature "
@@ -661,20 +629,13 @@ def main():
     model.eval()
     device = next(model.parameters()).device
 
-    # Load SAE weights
-    use_amax = not args.legacy_steering
-    W_enc, b_enc, threshold = None, None, None
-    if use_amax:
-        sae_all = load_gemmascope_full(config)
-        W_dec = sae_all["W_dec"].to(device=device, dtype=torch.float32)
-        W_enc = sae_all["W_enc"].to(device=device, dtype=torch.float32)
-        b_enc = sae_all["b_enc"].to(device=device, dtype=torch.float32)
-        threshold = sae_all["threshold"].to(device=device, dtype=torch.float32)
-        print(f"[Arad-style] W_dec={W_dec.shape}, W_enc={W_enc.shape}, b_enc={b_enc.shape}, thr={threshold.shape}")
-    else:
-        W_dec, _ = load_gemmascope_decoder(config)
-        W_dec = W_dec.to(device=device, dtype=torch.float32)
-        print(f"[Legacy] W_dec: {W_dec.shape}")
+    # Load SAE weights (always load full encoder for Arad-style steering)
+    sae_all = load_gemmascope_full(config)
+    W_dec = sae_all["W_dec"].to(device=device, dtype=torch.float32)
+    W_enc = sae_all["W_enc"].to(device=device, dtype=torch.float32)
+    b_enc = sae_all["b_enc"].to(device=device, dtype=torch.float32)
+    threshold = sae_all["threshold"].to(device=device, dtype=torch.float32)
+    print(f"[Arad-style] W_dec={W_dec.shape}, W_enc={W_enc.shape}, b_enc={b_enc.shape}, thr={threshold.shape}")
     if config.get("sae", {}).get("normalize_decoder", False):
         W_dec = W_dec / (W_dec.norm(dim=1, keepdim=True).clamp(min=1e-12))
 
@@ -710,7 +671,7 @@ def main():
 
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
 
-    sae_enc = {"W_enc": W_enc, "b_enc": b_enc, "threshold": threshold} if use_amax else None
+    sae_enc = {"W_enc": W_enc, "b_enc": b_enc, "threshold": threshold}
 
     if args.multi_steer_top_n is not None:
         _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted,
@@ -724,7 +685,7 @@ def main():
 # ===========================================================
 # Logit mode (factual QA: delta_logit_target)
 # ===========================================================
-def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc=None):
+def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc):
 # ======================================================def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
     device = next(model.parameters()).device
 
@@ -790,12 +751,9 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             steer_resid = pc["base_resid"]
             hook_ran = True
         else:
-            if sae_enc is not None:
-                mk_hook, cap = make_steer_prehook_amax(
-                    model, args.layer, alpha, pc["pos"], steer_dir,
-                    sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
-            else:
-                mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pc["pos"], steer_dir)
+            mk_hook, cap = make_steer_prehook_amax(
+                model, args.layer, alpha, pc["pos"], steer_dir,
+                sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
             t0 = time.time()
             steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
             t1 = time.time()
@@ -871,7 +829,9 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
                     by_pos.setdefault(pos, []).append(pi)
 
                 for pos, pis_at_pos in by_pos.items():
-                    mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pos, steer_dir)
+                    mk_hook, cap = make_steer_prehook_amax(
+                        model, args.layer, alpha, pos, steer_dir,
+                        sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
                     prompts_batch = [prompt_cache[pi]["prompt"] for pi in pis_at_pos]
 
                     t0 = time.time()
@@ -1010,7 +970,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
 # ===========================================================
 # Refusal mode (SALADBench: generate + keyword refusal scoring)
 # ===========================================================
-def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc=None):
+def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc):
     """
     For each (prompt, feature, alpha):
       1. Generate a short response with steering applied.
@@ -1090,7 +1050,9 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 gen_texts = [baseline_refusal[pi]["base_text"] for pi in pending_pis]
                 hook_ran = True
             else:
-                mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
+                mk_hook, cap = make_steer_prehook_amax_lastpos(
+                    model, args.layer, alpha, steer_dir,
+                    sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
                 batch_prompts = [baseline_refusal[pi]["prompt"] for pi in pending_pis]
                 gen_texts = generate_steered_batch(
                     model, tokenizer, batch_prompts,
@@ -1292,7 +1254,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
 # Multi-feature mode: steer with top-N features simultaneously
 # ===========================================================
 def _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted,
-                            threshold_T, args, config, sae_enc=None):
+                            threshold_T, args, config, sae_enc):
     """Steer with top-N features combined into a single direction, sweep alphas.
 
     Runs in either logit or refusal sub-mode based on args.mode.
@@ -1338,12 +1300,9 @@ def _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, a
                 steer_logits = pc["base_logits"]
                 steer_resid = pc["base_resid"]
             else:
-                if sae_enc is not None:
-                    mk_hook, cap = make_steer_prehook_multi_amax(
-                        model, args.layer, alpha, pc["pos"], steer_dirs,
-                        sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
-                else:
-                    mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pc["pos"], combined_dir)
+                mk_hook, cap = make_steer_prehook_multi_amax(
+                    model, args.layer, alpha, pc["pos"], steer_dirs,
+                    sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
                 steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
 
             steer_t = torch.dot(steer_resid, pc["w_t"])
@@ -1377,12 +1336,9 @@ def _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, a
             if alpha == 0.0:
                 gen_text = br["base_text"]
             else:
-                if sae_enc is not None:
-                    mk_hook, cap = make_steer_prehook_multi_amax_lastpos(
-                        model, args.layer, alpha, steer_dirs,
-                        sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
-                else:
-                    mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, combined_dir)
+                mk_hook, cap = make_steer_prehook_multi_amax_lastpos(
+                    model, args.layer, alpha, steer_dirs,
+                    sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
                 gen_text = generate_steered(model, tokenizer, br["prompt"],
                                             max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat)
 
