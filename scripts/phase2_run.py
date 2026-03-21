@@ -190,14 +190,16 @@ def make_steer_prehook_amax(model, layer_idx: int, alpha: float, pos: int,
                             steer_dir: torch.Tensor, W_enc: torch.Tensor,
                             b_enc: torch.Tensor, threshold: torch.Tensor):
     """Activation-scaled steering at a single position (logit mode)."""
-    ran = {"ok": False}
+    ran = {"ok": False, "a_max_values": []}
     def _mk():
+        ran["a_max_values"].clear()
         def _prehook(module, inputs):
             hidden = inputs[0]
             ran["ok"] = True
             hidden2 = hidden.clone()
             resid = hidden2[0, pos, :].float()
             a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+            ran["a_max_values"].append(float(a_max.item()))
             hidden2[0, pos, :] = hidden2[0, pos, :] + alpha * a_max * steer_dir
             return (hidden2,) + inputs[1:]
         layer = model.model.layers[layer_idx]
@@ -213,8 +215,9 @@ def make_steer_prehook_amax_lastpos(model, layer_idx: int, alpha: float,
 
     Per batch row: each sequence gets its own a_max from its last-token residual.
     """
-    ran = {"ok": False}
+    ran = {"ok": False, "a_max_values": []}
     def _mk():
+        ran["a_max_values"].clear()
         def _prehook(module, inputs):
             hidden = inputs[0]  # (batch, seq, d_model)
             ran["ok"] = True
@@ -222,6 +225,7 @@ def make_steer_prehook_amax_lastpos(model, layer_idx: int, alpha: float,
             for b in range(hidden2.shape[0]):
                 resid = hidden2[b, -1, :].float()
                 a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+                ran["a_max_values"].append(float(a_max.item()))
                 hidden2[b, -1, :] = hidden2[b, -1, :] + alpha * a_max * steer_dir
             return (hidden2,) + inputs[1:]
         layer = model.model.layers[layer_idx]
@@ -239,14 +243,16 @@ def make_steer_prehook_multi_amax(model, layer_idx: int, alpha: float, pos: int,
     steer_dirs: (N, d_model) — one row per feature to steer.
     Intervention: hidden += alpha * a_max * sum(steer_dirs)."""
     combined = steer_dirs.sum(dim=0)
-    ran = {"ok": False}
+    ran = {"ok": False, "a_max_values": []}
     def _mk():
+        ran["a_max_values"].clear()
         def _prehook(module, inputs):
             hidden = inputs[0]
             ran["ok"] = True
             hidden2 = hidden.clone()
             resid = hidden2[0, pos, :].float()
             a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+            ran["a_max_values"].append(float(a_max.item()))
             hidden2[0, pos, :] = hidden2[0, pos, :] + alpha * a_max * combined
             return (hidden2,) + inputs[1:]
         layer = model.model.layers[layer_idx]
@@ -259,8 +265,9 @@ def make_steer_prehook_multi_amax_lastpos(model, layer_idx: int, alpha: float,
                                           b_enc: torch.Tensor, threshold: torch.Tensor):
     """Activation-scaled multi-feature steering at the last token only (for generation)."""
     combined = steer_dirs.sum(dim=0)
-    ran = {"ok": False}
+    ran = {"ok": False, "a_max_values": []}
     def _mk():
+        ran["a_max_values"].clear()
         def _prehook(module, inputs):
             hidden = inputs[0]
             ran["ok"] = True
@@ -268,6 +275,7 @@ def make_steer_prehook_multi_amax_lastpos(model, layer_idx: int, alpha: float,
             for b in range(hidden2.shape[0]):
                 resid = hidden2[b, -1, :].float()
                 a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+                ran["a_max_values"].append(float(a_max.item()))
                 hidden2[b, -1, :] = hidden2[b, -1, :] + alpha * a_max * combined
             return (hidden2,) + inputs[1:]
         layer = model.model.layers[layer_idx]
@@ -478,7 +486,8 @@ def main():
     ap.add_argument("--config", type=str, default="configs/targets/gemma2_2b_gemmascope_res16k.yaml")
     ap.add_argument("--prompt_csv", type=str, default=None, help="Override benchmark.prompt_csv from config")
     ap.add_argument("--out_dir", type=str, default="outputs/phase2")
-    ap.add_argument("--layer", type=int, default=20)
+    ap.add_argument("--layer", type=int, default=None,
+                    help="Steering layer index. Defaults to config.sae.layer_idx, then 20.")
     ap.add_argument("--n_prompts", type=int, default=None, help="Override benchmark.prompt_count from config")
     ap.add_argument("--n_features", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1234)
@@ -521,6 +530,11 @@ def main():
             "config sae.sae_id must be set to a concrete identifier (e.g. 20-gemmascope-res-16k/2263). "
             f"Got: {sae_id!r}. No mercy: every run must be reproducible."
         )
+
+    # Resolve --layer: CLI > config.sae.layer_idx > 20
+    if args.layer is None:
+        args.layer = config.get("sae", {}).get("layer_idx", 20)
+    print(f"[Config] steering layer={args.layer}")
 
     # CLI overrides config; config must be sufficient to run
     bench = config.get("benchmark", {})
@@ -678,6 +692,38 @@ def main():
 
     sae_enc = {"W_enc": W_enc, "b_enc": b_enc, "threshold": threshold}
 
+    # --- Arad steering sanity check ---
+    # Run one prompt through the hook with alpha=1.0 to verify a_max is real.
+    _verify_fid = feature_ids[0]
+    _verify_dir = W_dec[_verify_fid].to(device=device, dtype=torch.float32)
+    _verify_norm = float(_verify_dir.norm().item())
+    _verify_prompt = dfp.iloc[0]["prompt"] if len(dfp) > 0 else "Hello"
+    use_chat = config.get("model", {}).get("use_chat_template", True)
+    mk_hook_v, cap_v = make_steer_prehook_amax_lastpos(
+        model, args.layer, 1.0, _verify_dir, W_enc, b_enc, threshold)
+    _ = generate_steered_batch(
+        model, tokenizer, [_verify_prompt],
+        max_new_tokens=1, prehook=mk_hook_v, use_chat_template=use_chat,
+    )
+    _v_amax = cap_v["a_max_values"][0] if cap_v["a_max_values"] else float("nan")
+    print(f"[Arad steering check] feature={_verify_fid}, a_max={_v_amax:.6f}, "
+          f"scaled_norm={abs(1.0) * _v_amax * _verify_norm:.6f}. "
+          f"{'WARNING: a_max=1.0 — this looks like legacy steering!' if abs(_v_amax - 1.0) < 1e-6 else 'OK: a_max varies (Arad steering is active).'}")
+    # Spot-check a second feature+prompt if available
+    if len(feature_ids) > 1 and len(dfp) > 1:
+        _v2_fid = feature_ids[1]
+        _v2_dir = W_dec[_v2_fid].to(device=device, dtype=torch.float32)
+        _v2_prompt = dfp.iloc[1]["prompt"]
+        mk_hook_v2, cap_v2 = make_steer_prehook_amax_lastpos(
+            model, args.layer, 1.0, _v2_dir, W_enc, b_enc, threshold)
+        _ = generate_steered_batch(
+            model, tokenizer, [_v2_prompt],
+            max_new_tokens=1, prehook=mk_hook_v2, use_chat_template=use_chat,
+        )
+        _v2_amax = cap_v2["a_max_values"][0] if cap_v2["a_max_values"] else float("nan")
+        print(f"[Arad steering check] feature={_v2_fid}, a_max={_v2_amax:.6f} "
+              f"(different from first: {abs(_v_amax - _v2_amax) > 1e-6})")
+
     if args.multi_steer_top_n is not None:
         _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted,
                                 threshold_T, args, config, sae_enc=sae_enc)
@@ -792,6 +838,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
                         "target_is_top1": bool(steer_rank == 1),
                         "steering_vector_norm": steer_norm,
                         "scaled_vector_norm": 0.0,
+                        "a_max": 0.0,
                     })
                     completed_this_session += 1
                     pbar.update(1)
@@ -816,6 +863,8 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
                     )
                     t1 = time.time()
                     hook_ran = cap["ok"]
+                    # Single forward: hook fires once, captures one a_max
+                    a_max_val = cap["a_max_values"][0] if cap["a_max_values"] else float("nan")
                     if (t1 - t0) > 5.0:
                         print(f"[SLOW] batch forward {t1-t0:.2f}s  feat={fid} alpha={alpha} n={len(pis_at_pos)}")
 
@@ -842,7 +891,8 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
                             "base_rank": base_rank, "steer_rank": steer_rank,
                             "target_is_top1": bool(steer_rank == 1),
                             "steering_vector_norm": steer_norm,
-                            "scaled_vector_norm": abs(alpha) * steer_norm,
+                            "scaled_vector_norm": abs(alpha) * a_max_val * steer_norm,
+                            "a_max": a_max_val,
                         })
                         completed_this_session += 1
                         pbar.update(1)
@@ -1004,6 +1054,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     # Outer loop: (feature, alpha) — one batched generate per pair.
     fa_pairs = list(dict.fromkeys(product(feature_ids, alphas_sorted)))
     pbar = tqdm(total=total_tasks, desc="Steering (refusal)")
+    _amax_range_printed = False
 
     for fid, alpha in fa_pairs:
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
@@ -1025,6 +1076,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 # Reuse cached baseline — no model call
                 gen_texts = [baseline_refusal[pi]["base_text"] for pi in pending_pis]
                 hook_ran = True
+                # a_max=0 for alpha=0 (no steering applied)
+                batch_a_max = [0.0] * len(pending_pis)
             else:
                 mk_hook, cap = make_steer_prehook_amax_lastpos(
                     model, args.layer, alpha, steer_dir,
@@ -1035,8 +1088,21 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                     max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat,
                 )
                 hook_ran = cap["ok"]
+                # First forward pass produces one a_max per batch row;
+                # subsequent forwards (autoregressive tokens) append more.
+                # Use the first len(pending_pis) values as the prompt-level a_max.
+                n = len(pending_pis)
+                batch_a_max = cap["a_max_values"][:n] if len(cap["a_max_values"]) >= n else cap["a_max_values"] + [float("nan")] * (n - len(cap["a_max_values"]))
 
-            for pi, gen_text in zip(pending_pis, gen_texts):
+            if not _amax_range_printed and alpha != 0.0 and batch_a_max:
+                _amax_range_printed = True
+                _amax_arr = [v for v in batch_a_max if not (isinstance(v, float) and v != v)]
+                if _amax_arr:
+                    print(f"[a_max range] first batch: min={min(_amax_arr):.6f}, max={max(_amax_arr):.6f}, "
+                          f"n={len(_amax_arr)}. "
+                          f"{'WARNING: all identical — may be legacy steering!' if len(set(round(v, 6) for v in _amax_arr)) == 1 and len(_amax_arr) > 1 else 'OK: values vary.'}")
+
+            for pi, gen_text, a_max_val in zip(pending_pis, gen_texts, batch_a_max):
                 br = baseline_refusal[pi]
                 ref_score = _refusal_score(gen_text)
                 delta_refusal = ref_score - br["base_refusal"]
@@ -1049,7 +1115,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                     "hook_ran": bool(hook_ran),
                     "gen_text": gen_text[:500],
                     "steering_vector_norm": steer_norm,
-                    "scaled_vector_norm": abs(alpha) * steer_norm,
+                    "scaled_vector_norm": abs(alpha) * a_max_val * steer_norm,
+                    "a_max": a_max_val,
                 })
                 completed_this_session += 1
                 pbar.update(1)
@@ -1487,7 +1554,7 @@ def _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args, sort_col
         "gen_text",
         "delta_logit_target", "tv_distance", "kl_base_to_steer",
         "hook_ran",
-        "steering_vector_norm", "scaled_vector_norm",
+        "steering_vector_norm", "scaled_vector_norm", "a_max",
     ] if c in full_df.columns]
     # Cap at 10k rows for the table to avoid W&B limits
     prompt_results_table = wandb.Table(dataframe=full_df[pr_cols].head(10000))
