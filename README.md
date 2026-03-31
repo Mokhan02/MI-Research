@@ -35,25 +35,99 @@ These are loaded automatically by all scripts (via `python-dotenv`). You do **no
 
 ### Run the pipeline
 
+The steps below are for a clean instance (e.g. a cloud GPU). Steps 3–5 only need to run once; if you already have `outputs/phase2_select_salad/selected_features_filtered.json` from a previous run you can skip straight to step 6.
+
+**Step 1 — Clone and install**
+
 ```bash
-# 1. Contrast feature selection (real model + SAE)
-uv run python scripts/phase2_select_contrast.py \
-  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
-  --domain planets --out_dir outputs/phase2_select --top-k 100
-
-# 2. Measure steerability (real SAE, matched features + prompts)
-uv run python scripts/phase2_run.py \
-  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
-  --out_dir outputs/phase2 --n_prompts 100 \
-  --fixed_features_path outputs/phase2_select/selected_features_planets.json
-
-# 3. Predict α* from geometry
-uv run python scripts/phase3_predictability.py \
-  --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
-  --phase2_dir outputs/phase2 --out_dir outputs/phase3
+git clone https://github.com/Mokhan02/MI-Research.git
+cd MI-Research
+curl -Lsf https://astral.sh/uv/install.sh | sh
+uv venv && source .venv/bin/activate
+uv pip install -e .
 ```
 
-Results land in `outputs/phase2_select/` (feature summaries), `outputs/phase2/` (run_rows.csv, alpha_star.csv, curves), and `outputs/phase3/` (correlation results, scatter plots).
+**Step 2 — Credentials**
+
+```bash
+cat > .env <<EOF
+HF_TOKEN=your_hf_token
+WANDB_API_KEY=your_wandb_key
+WANDB_PROJECT=sae-refusal-steering
+WANDB_ENTITY=your_wandb_entity
+WANDB_MODE=online
+EOF
+```
+
+You need HuggingFace access to `google/gemma-2-2b-it` and `google/gemma-scope-2b-pt-res`. Accept the model licenses on HuggingFace before running if you haven't already.
+
+**Step 3 — Prepare SALADBench prompt CSV** *(skip if `data/prompts/salad_alpha.csv` already exists)*
+
+```bash
+PYTHONPATH=. python scripts/prepare_salad_bench.py \
+    --out_dir data/prompts \
+    --n_prompts 300 \
+    --seed 42
+```
+
+**Step 4 — Feature selection: contrast scoring**
+
+```bash
+PYTHONPATH=. python scripts/phase2_select_contrast.py \
+    --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+    --domain salad \
+    --prompts_dir data/prompts \
+    --out_dir outputs/phase2_select_salad \
+    --top-k 300 \
+    --scoring composite \
+    --pooling max
+```
+
+Output: `outputs/phase2_select_salad/selected_features_salad.json`
+
+**Step 5 — Output-score filtering (Arad-style causal check)**
+
+```bash
+PYTHONPATH=. python scripts/compute_output_scores.py \
+    --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+    --features_path outputs/phase2_select_salad/selected_features_salad.json \
+    --out_path outputs/phase2_select_salad/output_scores.json \
+    --threshold 0.01 \
+    --filtered_out outputs/phase2_select_salad/selected_features_filtered.json \
+    --top_k 100
+```
+
+Output: `outputs/phase2_select_salad/selected_features_filtered.json` — the 100 features used in the main run.
+
+**Step 6 — Main steering run**
+
+```bash
+PYTHONPATH=. python scripts/phase2_run.py \
+    --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+    --mode refusal \
+    --prompt_csv data/prompts/salad_alpha.csv \
+    --fixed_features_path outputs/phase2_select_salad/selected_features_filtered.json \
+    --out_dir outputs/phase2_fullrun \
+    --layer 20 \
+    --n_prompts 100 \
+    --batch_size 32
+```
+
+`--fixed_features_path` is required — omitting it causes random feature sampling and scientifically invalid results (the W&B run will be tagged `random` instead of `contrast_delta` as a warning). The alpha grid `[0, 0.25, 0.5, 1, 2, 3, 5]` is read from the config. On a GH200/H100 expect ~30–45 minutes. W&B logs `frac_degenerate` live; a `[WARNING]` is also printed to console if coherence drops.
+
+**Step 7 — Geometry and correlation analysis**
+
+```bash
+PYTHONPATH=. python scripts/phase3_predictability.py \
+    --config configs/targets/gemma2_2b_gemmascope_res16k.yaml \
+    --run_dir outputs/phase2_fullrun \
+    --out_dir outputs/steerability_analysis \
+    --layer 20
+```
+
+Output: `outputs/steerability_analysis/correlations.csv`
+
+Results land in `outputs/phase2_select_salad/` (feature summaries), `outputs/phase2_fullrun/` (run_rows.csv, feature_summary.csv, curves), and `outputs/steerability_analysis/` (Spearman correlations, scatter plots).
 
 ### Device selection
 
@@ -85,7 +159,7 @@ Override in config YAML or pass `--device cpu` where supported.
 | Hook point | `blocks.20.hook_resid_post` (TransformerLens-style → `model.layers.20`) |
 | Features | 16,384 total; 300 selected by contrast; τ_act=2.0, token_span=last_n (n=8) |
 | Benchmark | SALADBench (refusal), 100 prompts |
-| Steering grid | α ∈ {0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0} |
+| Steering grid | α ∈ {0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0} (capped at 5 to avoid degenerate outputs) |
 | Threshold | T = 0.10 (minimum Δrefusal for α*) |
 
 ### Phase 1: Feature Selection (`phase2_select_contrast.py`)
