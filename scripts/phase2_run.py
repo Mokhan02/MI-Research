@@ -30,6 +30,28 @@ from src.sae_loader import load_gemmascope_full
 from src.refusal_scorer import refusal_score as _refusal_score
 
 # --------------------------
+# Coherence / degeneration detection
+# --------------------------
+import re as _re
+
+def _coherence_score(text: str, rep_window: int = 5) -> float:
+    """Return coherence in [0, 1].  Near 0 = degenerate (repetitive token loops).
+
+    Uses a sliding-window repetition rate blended with type-token ratio.
+    Returns 0.5 for very short outputs (< 5 tokens) — treated as uncertain.
+    """
+    tokens = _re.findall(r"\w+", text.lower())
+    if len(tokens) < 5:
+        return 0.5
+    repeats = sum(
+        1 for i in range(rep_window, len(tokens))
+        if tokens[i] in tokens[max(0, i - rep_window): i]
+    )
+    non_rep = 1.0 - repeats / max(1, len(tokens) - rep_window)
+    ttr = len(set(tokens)) / len(tokens)
+    return float(min(1.0, max(0.0, 0.7 * non_rep + 0.3 * ttr)))
+
+# --------------------------
 # Utils
 # --------------------------
 def set_determinism(seed: int = 1234):
@@ -1106,6 +1128,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 br = baseline_refusal[pi]
                 ref_score = _refusal_score(gen_text)
                 delta_refusal = ref_score - br["base_refusal"]
+                coh = _coherence_score(gen_text)
 
                 buffer.append({
                     "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
@@ -1113,6 +1136,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                     "base_refusal": br["base_refusal"],
                     "delta_refusal": delta_refusal,
                     "hook_ran": bool(hook_ran),
+                    "coherence_score": round(coh, 4),
                     "gen_text": gen_text[:500],
                     "steering_vector_norm": steer_norm,
                     "scaled_vector_norm": abs(alpha) * a_max_val * steer_norm,
@@ -1135,6 +1159,15 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 eta = (total_tasks - done_tasks) / max(1e-9, rate)
                 print(f"[Heartbeat] {done_tasks}/{total_tasks}  {rate:.1f} tasks/s  ETA {eta/60:.1f}min")
                 last_row = buffer[-1] if buffer else {}
+
+                # Degeneration check: warn if recent buffer has high fraction of incoherent outputs
+                recent = buffer[-min(100, len(buffer)):]
+                frac_degen = sum(1 for r in recent if r.get("coherence_score", 1.0) < 0.3) / max(1, len(recent))
+                if frac_degen > 0.3:
+                    print(f"[WARNING] High degeneration in last {len(recent)} rows: "
+                          f"{frac_degen:.0%} have coherence < 0.3. "
+                          f"Consider reducing max alpha.")
+
                 wandb.log({
                     "tasks_done": done_tasks,
                     "tasks_total": total_tasks,
@@ -1142,6 +1175,8 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                     "eta_min": eta / 60,
                     "refusal_score": last_row.get("refusal_score", float("nan")),
                     "delta_refusal": last_row.get("delta_refusal", float("nan")),
+                    "frac_degenerate": frac_degen,
+                    "coherence_score": last_row.get("coherence_score", float("nan")),
                 })
 
     pbar.close()
@@ -1167,10 +1202,24 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
         frac_ok = float(ok.mean())
         print(f"[Sanity] alpha=0: {frac_ok:.1%} of {len(df_alpha0)} rows have |delta_refusal|<1e-6")
 
+    # Filter degenerate steered outputs before computing steerability metrics.
+    # Baseline rows (alpha=0) are always retained — they seed base_refusal_rate.
+    # Steered rows with coherence_score < 0.3 are excluded: repetitive token loops
+    # are neither coherent refusal nor coherent compliance and would bias the summary.
+    if "coherence_score" in df.columns:
+        n_before = len(df)
+        mask_ok = (df["alpha"] == 0.0) | (df["coherence_score"] >= 0.3)
+        df_clean = df[mask_ok].copy()
+        n_degen = n_before - len(df_clean)
+        print(f"[Coherence filter] Excluded {n_degen} degenerate rows "
+              f"({n_degen / max(1, n_before):.1%}); {len(df_clean)} rows used for summary.")
+    else:
+        df_clean = df
+
     # Aggregate per feature: alpha* is min |alpha| where mean refusal drops by >= T
     summary_rows = []
     curve_rows = []
-    for fid, df_feat in df.groupby("feature_id"):
+    for fid, df_feat in df_clean.groupby("feature_id"):
         prompts = sorted(df_feat["prompt_idx"].unique())
         pos_alphas = sorted([a for a in alphas if a > 0])
         neg_alphas = sorted([a for a in alphas if a < 0], key=lambda a: -a)
@@ -1290,7 +1339,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     _write_outputs(summary_rows, curve_rows, alphas, threshold_T, args,
                    sort_cols=["alpha_star_feature_up", "base_refusal_rate"],
                    alpha_star_cols=["feature_id", "alpha_star_feature_up", "alpha_star_feature_down", "censored_up", "censored_down"],
-                   n_rows=len(df))
+                   n_rows=len(df_clean))
 
 
 # ===========================================================

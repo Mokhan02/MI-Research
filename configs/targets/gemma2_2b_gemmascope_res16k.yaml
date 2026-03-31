@@ -49,8 +49,10 @@ features:
   token_span_last_n: 8
 
 # On-target steering only
+# Grid capped at 5 to avoid degenerate repetition loops (coherence < 0.3 observed at alpha >= 5
+# with the previous [0..40] grid). Dense moderate range gives cleaner dose-response curves.
 steering:
-  alpha_grid: [0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  alpha_grid: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0]
   threshold_T: 0.10
   alpha0: 1.0
   tau: 0.1
