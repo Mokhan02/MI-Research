@@ -254,6 +254,30 @@ def make_steer_prehook_amax_lastpos(model, layer_idx: int, alpha: float,
         return layer.register_forward_pre_hook(_prehook)
     return _mk, ran
 
+
+def make_steer_prehook_vanilla_lastpos(model, layer_idx: int, alpha: float,
+                                       steer_dir: torch.Tensor):
+    """Vanilla fixed-vector steering at the last token only (no a_max scaling).
+
+    Intervention: h[:, -1, :] += alpha * steer_dir
+    Used as the control condition for the a_max confound experiment.
+    Compare correlations from this run against make_steer_prehook_amax_lastpos
+    to isolate the contribution of geometry vs a_max magnitude.
+    """
+    ran = {"ok": False, "a_max_values": []}
+    def _mk():
+        def _prehook(module, inputs):
+            hidden = inputs[0]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            for b in range(hidden2.shape[0]):
+                ran["a_max_values"].append(1.0)  # sentinel: a_max=1 means no scaling
+                hidden2[b, -1, :] = hidden2[b, -1, :] + alpha * steer_dir
+            return (hidden2,) + inputs[1:]
+        layer = model.model.layers[layer_idx]
+        return layer.register_forward_pre_hook(_prehook)
+    return _mk, ran
+
 # ------------------------------------------------------------------
 # Multi-feature steering: sum of top-N feature directions at once
 # ------------------------------------------------------------------
@@ -533,6 +557,12 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Number of prompts to process in parallel per (feature, alpha) pair. "
                          "Larger values use more GPU memory but give better throughput. Default 16.")
+    ap.add_argument("--no_amax", action="store_true",
+                    help="Use vanilla fixed-vector steering (alpha * W_dec[f]) instead of "
+                         "Arad-style activation-scaled steering (alpha * a_max * W_dec[f]). "
+                         "Run this as a control condition to isolate the a_max confound: if "
+                         "geometry correlations survive without a_max scaling, geometry is doing "
+                         "real work. W&B run is tagged 'vanilla_steering'.")
     args = ap.parse_args()
 
     if args.micro_sweep:
@@ -608,7 +638,7 @@ def main():
         tags=[
             model_cfg.get("model_id", "unknown"),
             f"layer_{args.layer}",
-            "activation_scaled",
+            "vanilla_steering" if args.no_amax else "activation_scaled",
             "contrast_delta" if args.fixed_features_path else "random",
             experiment_type,
         ],
@@ -630,7 +660,8 @@ def main():
             "sae_layer": sae_cfg.get("sae_id"),
 
             # Steering configuration (Section 2)
-            "steering_method": "activation_scaled",
+            "steering_method": "vanilla" if args.no_amax else "activation_scaled",
+            "no_amax": args.no_amax,
             "activation_scale_method": "fixed_alpha",
             "alpha_values": alphas,
             "alpha_max": max(alphas, key=abs),
@@ -1101,9 +1132,13 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 # a_max=0 for alpha=0 (no steering applied)
                 batch_a_max = [0.0] * len(pending_pis)
             else:
-                mk_hook, cap = make_steer_prehook_amax_lastpos(
-                    model, args.layer, alpha, steer_dir,
-                    sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
+                if args.no_amax:
+                    mk_hook, cap = make_steer_prehook_vanilla_lastpos(
+                        model, args.layer, alpha, steer_dir)
+                else:
+                    mk_hook, cap = make_steer_prehook_amax_lastpos(
+                        model, args.layer, alpha, steer_dir,
+                        sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
                 batch_prompts = [baseline_refusal[pi]["prompt"] for pi in pending_pis]
                 gen_texts = generate_steered_batch(
                     model, tokenizer, batch_prompts,
