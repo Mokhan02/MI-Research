@@ -1,0 +1,65 @@
+# Gemma-2-9B-IT with GemmaScope-9B-PT-Res (16K features) — Layer 36
+#
+# Model: google/gemma-2-9b-it
+# SAE:   google/gemma-scope-9b-pt-res  (same format as 2B, same loading code)
+# Layer: 36 out of 42 (~86% depth — proportional equivalent of layer 22/26 on the 2B)
+#
+# Generalizability claim: if geometry predicts steerability at 9B, the finding
+# scales across Gemma-2 model size with zero new code.
+
+model:
+  model_id: "google/gemma-2-9b-it"
+  device: "auto"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_set: "gemmascope-res-16k"
+  sae_id: "36-gemmascope-res-16k"
+  layer_idx: 36
+  hook_point: "blocks.36.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "google/gemma-scope-9b-pt-res"
+  weights_path: "layer_36/width_16k/average_l0_61/params.npz"
+  n_features_total: 16384
+
+architecture:
+  d_model: 3584
+  n_layers: 42
+  vocab_size: 256000
+
+sae_specs:
+  decoder_shape: [16384, 3584]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features_9b_l36.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+# Grid extended to 20; degenerate rows are filtered at analysis time by phase2_run.py.
+steering:
+  alpha_grid: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "gemma2-9b-gemmascope-res16k-layer36"
+  seed: 42
+  phase: 2

@@ -42,8 +42,9 @@ features:
   token_span: "last_n"
   token_span_last_n: 8
 
+# Grid aligned with 16k config; degenerate rows filtered at analysis time.
 steering:
-  alpha_grid: [0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  alpha_grid: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0]
   threshold_T: 0.10
   alpha0: 1.0
   tau: 0.1

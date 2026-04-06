@@ -1087,6 +1087,12 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 "base_refusal": _refusal_score(text),
             }
 
+    # Per-prompt lookup used to compute per-feature base_refusal_rate correctly.
+    # Keyed by prompt_idx so features tested on different prompt subsets get different rates.
+    baseline_score_by_prompt = {pi: v["base_refusal"] for pi, v in baseline_refusal.items()}
+    global_base_refusal_rate = float(np.mean(list(baseline_score_by_prompt.values()))) if baseline_score_by_prompt else float("nan")
+    print(f"[Baseline] global base_refusal_rate={global_base_refusal_rate:.4f} over {len(baseline_score_by_prompt)} prompts")
+
     all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
     total_tasks = len(all_jobs)
     run_csv = Path(args.out_dir) / "run_rows.csv"
@@ -1259,9 +1265,12 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
         pos_alphas = sorted([a for a in alphas if a > 0])
         neg_alphas = sorted([a for a in alphas if a < 0], key=lambda a: -a)
 
-        # Baseline refusal rate for this feature's prompts
-        base_rates = df_feat[df_feat["alpha"] == 0.0]["refusal_score"]
-        base_refusal_rate = float(base_rates.mean()) if len(base_rates) > 0 else np.nan
+        # Baseline refusal rate for this feature's actual prompt subset.
+        # Drawn from the pre-run baseline cache so it is independent of the run CSV
+        # and correctly varies if different features are ever tested on different prompts.
+        prompts_for_feat = df_feat["prompt_idx"].unique()
+        feat_base_scores = [baseline_score_by_prompt[pi] for pi in prompts_for_feat if pi in baseline_score_by_prompt]
+        base_refusal_rate = float(np.mean(feat_base_scores)) if feat_base_scores else global_base_refusal_rate
 
         # alpha* up: find smallest positive alpha where mean refusal drops by >= T
         alpha_star_up = np.nan
