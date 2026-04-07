@@ -22,7 +22,7 @@ This document lists **every code/config change** made to align our SAE steering 
 | Where | What changed |
 |-------|----------------|
 | `src/sae_loader.py` | Added `load_gemmascope_full()`: loads `W_enc`, `b_enc`, `threshold` from the same NPZ as `W_dec`. |
-| `scripts/phase2_run.py` | Default steering: instead of `hidden += alpha * W_dec[fid]`, we compute `a_max = max(relu(resid @ W_enc + b_enc - threshold))` and do `hidden += alpha * a_max * W_dec[fid]`. New hooks: `make_steer_prehook_amax`, `make_steer_prehook_amax_lastpos`. `--legacy_steering` keeps the old fixed-vector behaviour. |
+| `scripts/phase2_run.py` | Steering is activation-scaled only: `a_max = max(relu(resid @ W_enc + b_enc - threshold))`, then `hidden += alpha * a_max * W_dec[fid]`. Hooks: `make_steer_prehook_amax` (logit), `make_steer_prehook_amax_lastpos` (generation / refusal). Full SAE weights (encoder + threshold) are always loaded. |
 
 | Paper | Why |
 |-------|-----|

@@ -248,7 +248,7 @@ All Tier 1 changes from the alignment plan have been implemented:
   - `make_steer_prehook_amax_lastpos` — last-token-only steering (refusal/generation mode, matching Arad's `AmlifySAEHook`).
 - Both compute `a_max = max(relu(resid @ W_enc + b_enc - threshold))` from the live hidden state.
 - The `alpha` parameter is now the steering factor \(s\); effective perturbation is \(\alpha \cdot a_{\max} \cdot W_{\text{dec}}^{(i)}\).
-- Pass `--legacy_steering` to revert to the old fixed-vector mode for comparison.
+- Phase 2 no longer exposes a fixed-vector (`alpha * W_dec`) steering flag; runs always use activation scaling when encoder weights are available.
 
 ### 6.2 Output-score feature selection (implemented)
 
@@ -396,7 +396,7 @@ uv run python scripts/phase2_select_contrast.py \
 ## 8. Summary
 
 - **Arad et al.** steer by modifying SAE activations: increase feature \(i\) by \(s \cdot a_{\max}\) (where \(a_{\max}\) is the max activation at that token), then decode with \(W_{\text{dec}}\).
-- **Phase 2** now implements the same operator by default. Pass `--legacy_steering` for the old fixed-vector mode.
+- **Phase 2** implements the same operator; there is no CLI switch for fixed-vector-only steering.
 - **Feature selection** now supports three complementary methods:
   - Contrast-based candidate pool (with composite scoring from Bhargav & Zhu).
   - Output-score filtering (from Arad et al.) for causal effectiveness.

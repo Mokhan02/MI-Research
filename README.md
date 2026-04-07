@@ -1,41 +1,93 @@
 # Steerability as a Predictable Property of SAE Features
 
-This repository contains the pipeline for studying whether pre-steering geometric and usage properties of sparse autoencoder (SAE) features predict their **steerability** — defined as the minimum steering coefficient required to induce a fixed on-target behavioral change — and whether harder-to-steer features produce greater off-target effects under constrained steering.
+This repository contains a pipeline for studying whether **pre-steering** geometric and usage properties of sparse autoencoder (SAE) features predict their **steerability** — defined as the minimum steering coefficient required to induce a fixed on-target behavioral change — and whether harder-to-steer features produce greater off-target effects under constrained steering.
 
-## Overview
+---
 
-Feature steering with SAEs is increasingly used for model control and alignment, but coefficient selection today is largely ad hoc: researchers pick a handful of values and see what happens. This project operationalizes steerability as a measurable, pre-intervention property of individual SAE features and tests whether it can be predicted from geometry and usage statistics alone — *before* any steering is applied.
+## Initial Proposal
 
-The core thesis: features that are densely clustered in representation space or highly co-activated with neighboring features are more entangled, require larger steering coefficients to induce targeted effects, and cause greater collateral behavioral changes when forced.
+Feature steering with SAEs is increasingly used for model control and alignment, but coefficient selection is often ad hoc: researchers pick a handful of values and observe outcomes. This project operationalizes steerability as a measurable, **pre-intervention** property of individual SAE features and tests whether it can be predicted from geometry and usage statistics alone — *before* any steering is applied.
 
-## Quick Start
+The core thesis: features that are densely clustered in representation space or highly co-activated with neighboring features are more entangled, require larger steering coefficients to induce targeted effects, and (once Phase 4 exists) should show greater collateral behavioral changes when forced.
 
-### Prerequisites
+---
 
-- Python 3.11–3.12
-- [uv](https://docs.astral.sh/uv/) for dependency management
-- GPU recommended (MPS on Apple Silicon, CUDA on Linux/Windows) — CPU works but is slow
-- HuggingFace token for gated model access
-- [Weights & Biases](https://wandb.ai/) account for experiment tracking
+## Quick Overview
 
-### Installation
+There are three workflows in this repository:
+
+### Data preparation
+
+Governed by `scripts/prepare_salad_bench.py`. Builds the SALADBench-style prompt CSV used for refusal benchmarking.
+
+See **Datasets** and **Step 0** below.
+
+### Feature selection and filtering
+
+Contrast scoring (`scripts/phase2_select_contrast.py`) plus an optional Arad-style output-score filter (`scripts/compute_output_scores.py`) to drop features that do not pass a causal relevance check.
+
+See **Steps 1–2** in the experimental pipeline.
+
+### Steering run and analysis
+
+The main measurement loop is `scripts/phase2_run.py` (coefficient grid, α*, W&B logging). Follow with `scripts/phase3_predictability.py` for Spearman correlations and plots linking pre-steering metrics to log(α*).
+
+See **Steps 3–4** and **Output structure**.
+
+---
+
+## Style
+
+Keep code readable: prefer descriptive names (`dataset`, `prompt`, `feature_index`) over cryptic abbreviations, keep config-driven behavior explicit, and do not rely on `scripts/legacy/` or `archive/` for new work — those paths are reference-only.
+
+---
+
+## Testing
+
+There is no single `tests/` harness yet. For a quick sanity check on steering math (synthetic or full model):
 
 ```bash
-uv sync
+PYTHONPATH=. python scripts/smoke_test_amax.py --config configs/targets/gemma2_2b_gemmascope_res16k.yaml
 ```
 
-`.env` should contain:
+Omit `--config` to run the synthetic-only branch.
+
+---
+
+## Datasets
+
+| Artifact | Role |
+|----------|------|
+| `data/prompts/salad_alpha.csv` | Task prompts for refusal (SALADBench-derived); produced by `prepare_salad_bench.py` |
+| Neutral / control prompts | Used inside contrast selection (`phase2_select_contrast.py`) — must be structurally comparable to task prompts (see **Run gates**) |
+
+---
+
+## Pre-requisites
+
+- Python 3.11–3.12
+- [uv](https://docs.astral.sh/uv/) (`pip install uv` or the install script in quick start)
+- GPU strongly recommended (CUDA or Apple MPS); CPU works but is slow
+- HuggingFace account and token for gated weights (`google/gemma-2-2b-it`, GemmaScope)
+- [Weights & Biases](https://wandb.ai/) API key for experiment tracking
+
+Add to `.env` (loaded automatically via `python-dotenv`):
 
 ```
-WANDB_API_KEY=your_wandb_key
-HF_TOKEN=your_hf_token
+WANDB_API_KEY=...
+HF_TOKEN=...
+WANDB_PROJECT=sae-refusal-steering
+WANDB_ENTITY=...          # optional but typical
+WANDB_MODE=online         # or disabled
 ```
 
-These are loaded automatically by all scripts (via `python-dotenv`). You do **not** need to `export` them manually.
+You do **not** need to `export` these manually if they live in `.env`.
 
-### Run the pipeline
+---
 
-The steps below are for a clean instance (e.g. a cloud GPU). Steps 3–5 only need to run once; if you already have `outputs/phase2_select_salad/selected_features_filtered.json` from a previous run you can skip straight to step 6.
+## Experiment
+
+### One-shot quick start (clean machine)
 
 **Step 1 — Clone and install**
 
@@ -43,23 +95,13 @@ The steps below are for a clean instance (e.g. a cloud GPU). Steps 3–5 only ne
 git clone https://github.com/Mokhan02/MI-Research.git
 cd MI-Research
 curl -Lsf https://astral.sh/uv/install.sh | sh
-uv venv && source .venv/bin/activate
-uv pip install -e .
+uv sync
+source .venv/bin/activate   # if you use a venv; uv run also works
 ```
 
 **Step 2 — Credentials**
 
-```bash
-cat > .env <<EOF
-HF_TOKEN=your_hf_token
-WANDB_API_KEY=your_wandb_key
-WANDB_PROJECT=sae-refusal-steering
-WANDB_ENTITY=your_wandb_entity
-WANDB_MODE=online
-EOF
-```
-
-You need HuggingFace access to `google/gemma-2-2b-it` and `google/gemma-scope-2b-pt-res`. Accept the model licenses on HuggingFace before running if you haven't already.
+Create `.env` as in **Pre-requisites**. Accept model licenses on HuggingFace before first run.
 
 **Step 3 — Prepare SALADBench prompt CSV** *(skip if `data/prompts/salad_alpha.csv` already exists)*
 
@@ -97,7 +139,7 @@ PYTHONPATH=. python scripts/compute_output_scores.py \
     --top_k 100
 ```
 
-Output: `outputs/phase2_select_salad/selected_features_filtered.json` — the 100 features used in the main run.
+Output: `outputs/phase2_select_salad/selected_features_filtered.json` (the feature list used for the main run).
 
 **Step 6 — Main steering run**
 
@@ -113,7 +155,7 @@ PYTHONPATH=. python scripts/phase2_run.py \
     --batch_size 32
 ```
 
-`--fixed_features_path` is required — omitting it causes random feature sampling and scientifically invalid results (the W&B run will be tagged `random` instead of `contrast_delta` as a warning). The alpha grid `[0, 0.25, 0.5, 1, 2, 3, 5]` is read from the config. On a GH200/H100 expect ~30–45 minutes. W&B logs `frac_degenerate` live; a `[WARNING]` is also printed to console if coherence drops.
+`--fixed_features_path` is **required** for valid science: omitting it triggers random feature sampling (runs are tagged accordingly). The α grid is defined in config (default includes `0, 0.25, 0.5, 1, 2, 3, 5`). On a GH200/H100-class GPU, expect on the order of tens of minutes.
 
 **Step 7 — Geometry and correlation analysis**
 
@@ -125,126 +167,212 @@ PYTHONPATH=. python scripts/phase3_predictability.py \
     --layer 20
 ```
 
-Output: `outputs/steerability_analysis/correlations.csv`
-
-Results land in `outputs/phase2_select_salad/` (feature summaries), `outputs/phase2_fullrun/` (run_rows.csv, feature_summary.csv, curves), and `outputs/steerability_analysis/` (Spearman correlations, scatter plots).
+Output: `outputs/steerability_analysis/correlations.csv` plus plots.
 
 ### Device selection
 
-All configs default to `device: "auto"`, which picks the best available backend:
+Configs default to `device: "auto"`, which prefers MPS (Apple Silicon), then CUDA, then CPU. Override in YAML or with `--device` where a script supports it.
 
-1. **MPS** (Apple Silicon) — used automatically on macOS with M-series chips
-2. **CUDA** — used automatically when an NVIDIA GPU is available
-3. **CPU** — fallback
+---
 
-Override in config YAML or pass `--device cpu` where supported.
+## Experimental pipeline
 
-## Pipeline
+The pipeline moves from **raw prompts → ranked features → filtered features → steering curves → predictability analysis**:
 
-| Phase | Question | Script |
-|-------|----------|--------|
-| 1 | Select features by contrast (task − neutral) | `scripts/phase2_select_contrast.py` |
-| 2 | What steering coefficient does each feature require? | `scripts/phase2_run.py` |
-| 3 | Do pre-steering metrics predict steerability? | `scripts/phase3_predictability.py` |
-| 4 | What off-target effects does steering induce? | *(not yet implemented)* |
+```mermaid
+flowchart LR
+    A["Prompts CSV"] --> B["Contrast selection"]
+    B --> C["Output-score filter"]
+    C --> D["phase2_run: α grid, α*"]
+    D --> E["phase3: geometry vs log α*"]
+```
 
-**Do not run scripts in `scripts/legacy/`.** They are the old pipeline with fake SAE/steering/scores, kept only for reference.
+Outputs are deterministic given seeds except where sampling is explicit. If you already have `outputs/phase2_select_salad/selected_features_filtered.json` from a prior run, you can start at **Step 6** after confirming prompts and config match your paper plan.
 
-### Models and SAE
+---
 
-| Component | Value |
-|-----------|-------|
-| Model | `google/gemma-2-2b-it` (instruction-tuned) or `google/gemma-2-2b` (base) |
-| SAE | GemmaScope res-16k, layer 20 (`google/gemma-scope-2b-pt-res`) |
-| Hook point | `blocks.20.hook_resid_post` (TransformerLens-style → `model.layers.20`) |
-| Features | 16,384 total; 300 selected by contrast; τ_act=2.0, token_span=last_n (n=8) |
-| Benchmark | SALADBench (refusal), 100 prompts |
-| Steering grid | α ∈ {0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0} (capped at 5 to avoid degenerate outputs) |
-| Threshold | T = 0.10 (minimum Δrefusal for α*) |
+### Diagnostics (by step)
 
-### Phase 1: Feature Selection (`phase2_select_contrast.py`)
+#### Step 0: Prompt preparation (`scripts/prepare_salad_bench.py`)
 
-Contrast-based: top K by Δ = act_freq_task − act_freq_neutral. Uses real model + SAE decoder. Outputs `selected_features_<domain>.json` and `feature_summary_<domain>.csv`.
+| Question | What we measure |
+|----------|-------------------|
+| Do we have a fixed, versioned prompt set? | Writes `salad_alpha.csv` under `data/prompts/` |
 
-### Phase 2: Measuring Steerability (`phase2_run.py`)
+**Why this matters:** Downstream refusal rates and α* are only comparable across runs if the prompt distribution is frozen.
 
-Steering is applied as: `h' = h + α · v_f`
+---
 
-where `v_f` is the SAE decoder direction and `α` sweeps the grid. **Steerability** `α*(f)` = min α where Δrefusal ≥ T. Features that never reach T are right-censored.
+#### Step 1: Contrast-based feature selection (`scripts/phase2_select_contrast.py`)
 
-Outputs: `run_rows.csv`, `alpha_star.csv`, `curves_per_feature.parquet`.
+| Question | What we measure |
+|----------|-------------------|
+| Which features fire more on task than on neutral text? | Δ = act_freq_task − act_freq_neutral; top-K by composite score |
 
-### Phase 3: Predicting Steerability (`phase3_predictability.py`)
+**Why this matters:** Selecting by raw activation alone confounds prevalence with *task-specific* signal; contrast targets features aligned with the behavioral domain.
 
-Computes pre-steering geometric metrics (max cosine similarity, neighborhood density, co-activation correlation) and correlates them with log(α*) via Spearman rank correlation and regression.
+---
 
-### Phase 4: Off-Target Analysis
+#### Step 2: Output-score filter (`scripts/compute_output_scores.py`)
 
-To be implemented. Will measure collateral behavioral effects at α*(f) and at fixed low α₀.
+| Question | What we measure |
+|----------|-------------------|
+| Which selected features actually move the model’s output distribution on prompts? | Output-side score vs threshold; keep top subset |
 
-## Experiment Tracking (W&B)
+**Why this matters:** Decoder directions can be statistically salient without being causally influential; this step mirrors an Arad-style relevance screen.
 
-All pipeline scripts log to the `sae-refusal-steering` Weights & Biases project. Each run logs full config, tables, and artifacts per the instrumentation spec.
+---
 
-| Script | Run Name | Tables | Key Metrics |
-|--------|----------|--------|-------------|
-| `phase2_select_contrast.py` | `phase2_select_{domain}` | `feature_metrics` | delta_freq stats, decoder norms |
-| `phase2_run.py` | `phase2_run_{mode}` | `feature_metrics`, `feature_curves`, `prompt_results` | baseline_refusal_rate, refusal_drop_max, alpha_star, steering diagnostics |
-| `phase3_predictability.py` | `phase3_{run_name}` | `feature_metrics` | Spearman correlations, scatter plots |
+#### Step 3: Measuring steerability (`scripts/phase2_run.py`)
 
-Every run is tagged with model, layer, steering method, feature selection method, and experiment type for easy filtering. Artifacts (CSVs, Parquet, JSONs) are uploaded via `wandb.Artifact`.
+Steering: `h' = h + α · v_f` where `v_f` is the SAE decoder direction for feature `f`.
 
-Runs appear at `wandb.ai/<your-entity>/sae-refusal-steering`. Set `WANDB_MODE=disabled` in `.env` to skip logging.
+| Metric | Definition / use |
+|--------|-------------------|
+| **Steerability α*(f)** | Minimum α such that Δrefusal ≥ threshold `T` (pre-registered in config) |
+| **Censoring** | Features that never reach `T` must not be assigned α* = max(α); treat as no-effect for correlations |
+
+**Why this matters:** This is the **dependent variable** for Phase 3 — it must be measured on a fixed feature set and a fixed α grid.
+
+---
+
+#### Step 4: Predicting steerability (`scripts/phase3_predictability.py`)
+
+| Question | What we measure |
+|----------|-------------------|
+| Do pre-steering geometry predict log(α*)? | Spearman ρ, regression, scatter plots (density, co-activation, max cosine to neighbors, etc.) |
+
+**Why this matters:** If geometry explains little variance, coefficient search may be inherently high-variance for SAE steering at this layer/scale.
+
+---
+
+#### Step 5 (planned): Off-target analysis
+
+Not implemented in the main branch yet. Intended: collateral behavioral metrics at α*(f) and at a fixed low α₀.
+
+---
+
+### The big picture
+
+| Level | Question | Steps |
+|-------|----------|-------|
+| **Data** | Is the benchmark fixed and reproducible? | 0 |
+| **Features** | Which directions are task-specific and output-relevant? | 1–2 |
+| **Behavior** | What α achieves a pre-registered refusal shift? | 3 |
+| **Mechanism hypothesis** | Does entanglement predict hardness of steering? | 4 |
+| **Side effects** | What breaks when we push harder features? | 5 (planned) |
+
+---
+
+### Output structure
+
+```
+outputs/
+  phase2_select_salad/
+    selected_features_salad.json
+    selected_features_filtered.json   # after Step 2
+    output_scores.json
+    feature_summary_*.csv
+  phase2_fullrun/
+    run_rows.csv
+    alpha_star.csv
+    feature_summary.csv
+    curves_per_feature.parquet
+    ...
+  steerability_analysis/
+    correlations.csv
+    plots/
+```
+
+---
+
+## Experiment tracking (W&B)
+
+Runs log to the `sae-refusal-steering` project (override with `WANDB_PROJECT` in `.env`). Typical run names:
+
+| Script | Run name pattern | Key artifacts |
+|--------|------------------|---------------|
+| `phase2_select_contrast.py` | `phase2_select_{domain}` | `feature_metrics` |
+| `phase2_run.py` | `phase2_run_{mode}` | curves, prompt tables, α*, diagnostics |
+| `phase3_predictability.py` | `phase3_{run_name}` | correlation tables, figures |
+
+Set `WANDB_MODE=disabled` to run locally only.
+
+---
 
 ## Configuration
 
-Configs live in `configs/`. The target configs inherit from `configs/base.yaml`:
+YAML configs live under `configs/` and inherit from `configs/base.yaml`.
 
-- `configs/targets/gemma2_2b_gemmascope_res16k.yaml` — Gemma-2-2b-IT (main)
-- `configs/targets/gemma2_2b_base_gemmascope_res16k.yaml` — Gemma-2-2b base
+| Config | Use |
+|--------|-----|
+| `configs/targets/gemma2_2b_gemmascope_res16k.yaml` | Gemma-2-2b-it + GemmaScope res-16k, layer 20 (primary) |
+| `configs/targets/gemma2_2b_base_gemmascope_res16k.yaml` | Base model variant |
 
-## Run Gates
+---
 
-See **GATES.md** for the seven gates before a full run. Key points:
+## Models and SAE (reference)
 
-1. Domain prompt splits — no overlap between selection and evaluation
-2. Contrast-based selection — top K by Δ, not top K act_freq
-3. Micro sweep first — `phase2_run --micro_sweep` (10 features, ~25 prompts) before full K=100
-4. α* with censoring — never set α* = max for no-effect features
+| Component | Value |
+|-----------|--------|
+| Model | `google/gemma-2-2b-it` (main) or `google/gemma-2-2b` (base config) |
+| SAE | GemmaScope res-16k, layer 20 (`google/gemma-scope-2b-pt-res`) |
+| Hook | `blocks.20.hook_resid_post` → `model.layers.20` |
+| Features | 16,384 total; 300 contrast-selected; 100 after output filter (default commands above) |
+| Steering grid | α ∈ {0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0} (from config; cap avoids degenerate generations) |
+| Threshold | T = 0.10 on refusal Δ for α* (see config / gates) |
 
-See **LANDMINES.md** for six traps to audit (tau_act, token_span, T pre-registration, directionality, control matching, neutral isomorphism).
+---
 
-## Key Files
+## Run gates and landmines
 
-| File | Purpose |
+Before a full paper run, work through **[archive/docs/GATES.md](archive/docs/GATES.md)** (seven gates: splits, contrast selection, micro-sweep, censoring, etc.).
+
+For common analysis traps (τ_act, token span, pre-registration, controls), see **[archive/docs/LANDMINES.md](archive/docs/LANDMINES.md)**.
+
+**Do not use `scripts/legacy/` for production results** — old pipeline with non-production stubs; kept for reference only.
+
+---
+
+## Key files
+
+| Path | Purpose |
 |------|---------|
-| `src/model_utils.py` | Model loading with auto device detection (MPS/CUDA/CPU) |
-| `src/sae_loader.py` | Real SAE decoder loading (`load_gemmascope_decoder`) |
-| `src/hook_resolver.py` | TransformerLens ↔ HuggingFace hook name mapping |
+| `src/model_utils.py` | Model load + auto device |
+| `src/sae_loader.py` | GemmaScope decoder loading |
+| `src/hook_resolver.py` | TransformerLens ↔ HuggingFace hook names |
 | `src/refusal_scorer.py` | Keyword-based refusal classifier |
-| `src/config.py` | Config loading and validation |
+| `src/config.py` | Config load/validation |
+
+---
 
 ## Hypotheses
 
-| Hypothesis | What would confirm it |
-|------------|----------------------|
-| Geometry predicts steerability | Significant positive Spearman ρ between density/co-activation and log α*(f) |
-| Entangled features cause more collateral effects | Strong correlation between geometric metrics and off-target risk |
-| Steerability and off-target risk are related but distinct | Risk vs. α*(f) shows positive trend with meaningful residuals |
+| Hypothesis | What would support it |
+|------------|------------------------|
+| Geometry predicts steerability | Significant positive Spearman ρ between density / co-activation and log α*(f) |
+| Entangled features → more collateral damage | (Phase 4) Correlation of geometry with off-target metrics |
+| Steerability vs off-target are related but distinct | Positive trend with non-trivial residual structure |
+
+---
 
 ## Limitations
 
-- **Computational cost** — multiple benchmarks × coefficient grid × hundreds of features is expensive
-- **Single model and layer** — MVP focuses on Gemma-2-2b layer 20; may not generalize
-- **Behavior-specific thresholds** — T = 0.10 on refusal ≠ 0.10 on bias
-- **Generalization** — unclear if results transfer across architectures or depths
+- **Cost** — large grids × many features × benchmarks are expensive.
+- **Single stack** — MVP targets Gemma-2-2b layer 20; generalization unknown.
+- **Threshold semantics** — `T` on refusal is behavior-specific.
+- **External validity** — unclear transfer across depth, family, or SAE width.
 
-## Related Work
+---
 
-| Paper | Key Finding |
-|-------|------------|
-| [SAEs Are Good for Steering](https://arxiv.org/abs/2505.20063) | Steering is more effective on causally influential features |
-| [Geometry of Categorical Concepts in LLMs](https://arxiv.org/abs/2406.01506) | Clean concept geometry corresponds to better semantic alignment |
+## Related work
+
+| Paper | Takeaway |
+|-------|----------|
+| [SAEs Are Good for Steering](https://arxiv.org/abs/2505.20063) | Steering works best on causally influential features |
+| [Geometry of Categorical Concepts in LLMs](https://arxiv.org/abs/2406.01506) | Cleaner geometry ↔ better semantic alignment |
+
+---
 
 ## Team
 

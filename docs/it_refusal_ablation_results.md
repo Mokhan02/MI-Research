@@ -23,8 +23,8 @@ All runs use the same **model/config**, **prompt set**, **alpha grid**, and **ev
       \(a = \mathrm{ReLU}(W_{\text{enc}} x + b_{\text{enc}} - \text{threshold})\).
     - \(a_{\max} = \max_j a_j\).
     - Intervention: \(x \leftarrow x + \alpha \cdot a_{\max} \cdot W_{\text{dec}}^{(i)}\) at the last token.
-  - **Legacy fixed‑vector** (using `--legacy_steering`):
-    - Intervention: \(x \leftarrow x + \alpha \cdot W_{\text{dec}}^{(i)}\), no dependence on SAE activations.
+  - **Legacy fixed‑vector** (historical ablation only; `phase2_run.py` no longer supports this via CLI):
+    - Intervention: \(x \leftarrow x + \alpha \cdot W_{\text{dec}}^{(i)}\), no dependence on SAE activations. Older runs used a removed `--legacy_steering` flag.
 
 - **Refusal scoring**:
   - Mode: `--mode refusal` in `phase2_run.py`.
@@ -60,7 +60,7 @@ All runs use **25 features**, **30 prompts**, and **the same alpha grid**; only 
 
 - **Baseline (legacy steering)**  
   - Out dir: `outputs/phase2_salad_ablation_steering_legacy`  
-  - Steering: **legacy fixed‑vector** (`--legacy_steering`).  
+  - Steering: **legacy fixed‑vector** (historical run; used removed `--legacy_steering`).  
   - Features: top 25 from **composite‑contrast + output‑score–filtered** list.
 
 - **Run 1A – Activation‑scaled, filtered**  
@@ -262,11 +262,11 @@ Putting all three ablations together:
 
 **Recommended configuration for larger IT runs:**
 
-- **Steering:** activation‑scaled (Arad‑style) as implemented in `phase2_run.py` (no `--legacy_steering`).
+- **Steering:** activation‑scaled (Arad‑style) only (`phase2_run.py` no longer offers fixed‑vector steering).
 - **Feature selection:**
   - Primary: **composite contrast** (`--scoring composite --pooling max`) to rank features.
   - Optional refinement: **output‑score filtering** via `compute_output_scores.py` to slightly clean up the top‑K set and align more closely with Arad et al.’s methodology.
-- **Evaluation:** carry the **legacy steering** run as a baseline row in all future comparison tables (anchor for the prior setup), and log:
+- **Evaluation:** where relevant, keep **historical legacy-steering ablation** rows from past runs as a baseline anchor in comparison tables, and log:
   - `frac_uncensored_up`,
   - `mean_alpha_star_up`,
   - `mean_refusal_alpha_{alpha_target}`,

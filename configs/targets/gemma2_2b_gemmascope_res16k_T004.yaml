@@ -1,0 +1,62 @@
+# Phase 1 Locked Target: Gemma-2-2b with GemmaScope SAE
+# threshold_T=0.04 for re-aggregation only (no new generation)
+#
+model:
+  model_id: "google/gemma-2-2b-it"
+  device: "auto"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_set: "gemmascope-res-16k"
+  sae_id: "20-gemmascope-res-16k/2263"
+  layer_idx: 20
+  hook_point: "blocks.20.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "google/gemma-scope-2b-pt-res"
+  weights_path: "layer_20/width_16k/average_l0_71/params.npz"
+  n_features_total: 16384
+
+architecture:
+  d_model: 2304
+  n_layers: 26
+  vocab_size: 256000
+
+sae_specs:
+  decoder_shape: [16384, 2304]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+steering:
+  alpha_grid: [0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  threshold_T: 0.04
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "gemma2-2b-gemmascope-res16k-layer20"
+  seed: 42
+  phase: 1
+
+sanity:
+  feature_id: 2263
+  feature_ids: [2317, 8978, 15199, 2713, 10792, 4378, 5441, 8195, 14537, 14885]
