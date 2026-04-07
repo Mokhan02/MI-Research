@@ -70,7 +70,7 @@ Before a full K=100 run:
 **How:** `phase2_run.py --micro_sweep` (sets n_features=10, n_prompts=25, alphas=0,0.5,1,2,5). Use `*_alpha.csv` as prompt_csv.
 
 ```bash
-uv run python scripts/phase2_run.py --micro_sweep --prompt_csv data/prompts/planets_alpha.csv --fixed_features_path outputs/phase2_select/selected_features_planets.json --out_dir outputs/phase2_micro
+uv run python scripts/phase2_run.py --micro_sweep --prompt_csv archive/data/legacy/prompts/planets_alpha.csv --fixed_features_path outputs/phase2_select/selected_features_planets.json --out_dir outputs/phase2_micro
 ```
 
 ## 7) α* rule and no-effect handling

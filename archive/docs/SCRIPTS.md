@@ -17,7 +17,7 @@ Aligned to **docs/PROPOSAL.md** and the runnable pipeline in **docs/RUN.md**.
 | **02_presteering_metrics.py** | Phase 1: max_cos_sim, neighbor_density, coactivation (expects `selected_features.npy` from 01; can be adapted to read JSON). |
 | **make_domain_splits.py** | Build *_select / *_alpha / *_holdout from source CSVs. |
 | **make_phase2_csvs.py** | Build planets_only.csv, capitals_only.csv with prompt+target and " Answer:" scaffolding. |
-| **compute_alignment_mean_target.py** | Optional: cos(w_dec, u_target) per feature. |
+| **archive/scripts/utilities/compute_alignment_mean_target.py** | Optional: cos(w_dec, u_target) per feature. |
 | **audit_activation_distribution.py** | Optional: activation percentiles to set tau_act. |
 
 ---
@@ -59,6 +59,6 @@ If you want the repo to contain **only** what the proposal needs:
 3. **Phase 3:** phase3_predictability.py, phase3_predict_cv.py (and optionally phase3_predict_cv_np.py)  
 4. **Phase 4:** 04_offtarget.py  
 5. **Phase 1 (metrics):** 02_presteering_metrics.py (after adapting to read features from selected_features_planets.json instead of 01’s selected_features.npy)  
-6. **Optional:** compute_alignment_mean_target.py, audit_activation_distribution.py, verify_target.py, 99_hook_sanity.py  
+6. **Optional:** `archive/scripts/utilities/compute_alignment_mean_target.py`, audit_activation_distribution.py, verify_target.py, 99_hook_sanity.py  
 
 You can **move** 01, 03, 05, 10, 11, 11b, make_feature_sets, phase1_smoke, debug_steer_effect, phase2_sanity_plot into an `archive/` or `scripts/legacy/` folder, or delete them if you’re sure you won’t need the old pipeline.

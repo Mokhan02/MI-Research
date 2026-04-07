@@ -273,5 +273,5 @@ Putting all three ablations together:
   - `baseline_refusal`,
   together with representative refusal curves from `curves_per_feature`.
 
-This document, together with `steering_arad_vs_phase2.md`, should provide a complete record of both **how** the Arad‑style steering was implemented and **which design choices actually mattered** on the IT refusal benchmark.
+This document, together with `archive/notes/steering_arad_vs_phase2.md`, should provide a complete record of both **how** the Arad‑style steering was implemented and **which design choices actually mattered** on the IT refusal benchmark.
 

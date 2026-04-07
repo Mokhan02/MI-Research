@@ -62,7 +62,7 @@ That is, the residual at that layer is the SAE reconstruction of the steered act
 
 ### 3.3 Summary vs our plan
 
-| Aspect | Arad code | Our plan (steering_arad_vs_phase2.md) |
+| Aspect | Arad code | Our plan ([steering_arad_vs_phase2.md](../archive/notes/steering_arad_vs_phase2.md)) |
 |--------|-----------|----------------------------------------|
 | Scaling | \(s \cdot a_{\max}\) at last token | Same: \(\alpha \cdot a_{\max}\) (we can do last-token or all positions). |
 | Application | Replace residual: decode(modified_acts) + error | We proposed **add** \(\alpha \cdot a_{\max} \cdot W_{\text{dec}}^{(i)}\) (linearized). |
@@ -131,4 +131,4 @@ We use a single layer and a flat list in `selected_features_*.json`; we can adap
 
 - Repo: [technion-cs-nlp/saes-are-good-for-steering](https://github.com/technion-cs-nlp/saes-are-good-for-steering)
 - Paper: [Arad et al., SAEs Are Good for Steering – If You Select the Right Features (EMNLP 2025)](https://arxiv.org/abs/2505.20063)
-- Our alignment plan: [steering_arad_vs_phase2.md](../steering_arad_vs_phase2.md) and the SAE steering alignment plan in `.cursor/plans/`
+- Our alignment plan: [steering_arad_vs_phase2.md](../archive/notes/steering_arad_vs_phase2.md) and the SAE steering alignment plan in `.cursor/plans/`

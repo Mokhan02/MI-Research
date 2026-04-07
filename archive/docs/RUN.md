@@ -7,11 +7,11 @@ Minimal path to run the proposal pipeline (Phase 2 steerability → Phase 3 pred
 - **Config:** `configs/targets/gemma2_2b_gemmascope_res16k.yaml` (model, SAE, benchmark, steering.alpha_grid, steering.threshold_T).
 - **Prompt CSVs:** Must have columns `prompt` and `target`; every row must have a non-empty target (used for delta_logit_target).
 - **Data layout:** Domain splits in `data/prompts/`:
-  - `planets_select.csv`, `planets_alpha.csv`, `planets_holdout.csv`
+  - Legacy paths: `archive/data/legacy/prompts/planets_select.csv`, `planets_alpha.csv`, `planets_holdout.csv`
   - `neutral_select.csv`, `neutral_alpha.csv`, `neutral_holdout.csv`
   - (Optional) same for `capitals`.
 
-Config’s `benchmark.prompt_csv` points at `data/prompts/planets_alpha.csv` by default.
+Historical runs used `archive/data/legacy/prompts/planets_alpha.csv`; the current pipeline uses SALAD prompts from `prepare_salad_bench.py`.
 
 ## 1. Feature selection (contrast: task − neutral)
 
@@ -47,7 +47,7 @@ PYTHONPATH=. python scripts/phase2_run.py \
 ```
 
 - Omit `--fixed_features_path` to sample `--n_features` (default 300) at random.
-- Override prompt set: `--prompt_csv data/prompts/planets_alpha.csv` (or leave default from config).
+- Override prompt set: `--prompt_csv archive/data/legacy/prompts/planets_alpha.csv` (legacy) or your SALAD CSV under `data/prompts/`.
 - Micro sweep (fewer features/prompts/alphas): add `--micro_sweep`.
 
 **Outputs (in `out_dir`):**
@@ -63,7 +63,7 @@ Needs Phase 1 metrics (e.g. from `02_presteering_metrics.py`) merged with Phase 
 ## Quick test (no GPU / small run)
 
 - Use `--n_prompts 20` and `--n_features 5` (and no `--fixed_features_path`) or `--micro_sweep` to reduce load.
-- Ensure `data/prompts/planets_alpha.csv` exists and has `prompt,target` with non-empty targets.
+- Ensure the prompt CSV you pass exists and has `prompt,target` with non-empty targets (legacy files live under `archive/data/legacy/prompts/`).
 
 ## Troubleshooting
 
@@ -72,4 +72,4 @@ Needs Phase 1 metrics (e.g. from `02_presteering_metrics.py`) merged with Phase 
 | "No prompts with explicit target" | CSV must have `target` column and no empty targets. |
 | "sae.sae_id must be set" | In config, set `sae.sae_id` to a concrete id (e.g. `20-gemmascope-res-16k/2263`). |
 | Missing `planets_alpha.csv` | Run `make_domain_splits.py` (and ensure source CSVs have targets) or point `--prompt_csv` to another CSV with prompt+target. |
-| phase2_select fails on missing select CSV | Ensure `data/prompts/planets_select.csv` and `neutral_select.csv` exist. |
+| phase2_select fails on missing select CSV | For legacy domains, ensure `archive/data/legacy/prompts/planets_select.csv` and `neutral_select.csv` exist (or point `--prompts_dir` at that folder). |

@@ -1,7 +1,9 @@
 """Re-score existing run_rows.csv with updated refusal scorer. No GPU needed."""
 import sys, argparse
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT))
 
 import pandas as pd
 import numpy as np

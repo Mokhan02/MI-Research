@@ -132,7 +132,7 @@ uv run python scripts/phase2_run.py \
 - **4. Re-score pilot with updated refusal scorer (no GPU)**
 
 ```bash
-uv run python scripts/rescore_pilot.py
+PYTHONPATH=. python archive/scripts/utilities/rescore_pilot.py
 ```
 
 - **5. Phase 3 on pilot outputs (geometry vs alpha\*)**
@@ -175,6 +175,6 @@ uv run python scripts/phase2_run.py \
   --flush_every 100
 ```
 
-- **Then reuse `scripts/rescore_pilot.py` (pointed at `outputs/phase2_salad_full`) and rerun Phase 3 with `--phase2_dir outputs/phase2_salad_full` to get the full-scale results.**
+- **Then reuse `archive/scripts/utilities/rescore_pilot.py` (pointed at `outputs/phase2_salad_full`) and rerun Phase 3 with `--phase2_dir outputs/phase2_salad_full` to get the full-scale results.**
 
 

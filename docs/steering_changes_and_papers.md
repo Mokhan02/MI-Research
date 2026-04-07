@@ -84,9 +84,9 @@ This document lists **every code/config change** made to align our SAE steering 
 
 | Where | What changed |
 |-------|----------------|
-| `configs/targets/gemma2_2b_gemmascope_res65k.yaml` | Layer 20, **65K** features. `weights_path`: `layer_20/width_65k/average_l0_61/params.npz` (verified on HF). |
-| `configs/targets/gemma2_2b_gemmascope_layer22.yaml` | **Layer 22**, 16K. `weights_path`: `layer_22/width_16k/average_l0_72/params.npz`. |
-| `configs/targets/gemma2_2b_gemmascope_layer24.yaml` | **Layer 24**, 16K. `weights_path`: `layer_24/width_16k/average_l0_73/params.npz`. |
+| `archive/configs/targets/gemma2_2b_gemmascope_res65k.yaml` | Layer 20, **65K** features. `weights_path`: `layer_20/width_65k/average_l0_61/params.npz` (verified on HF). |
+| `archive/configs/targets/gemma2_2b_gemmascope_layer22.yaml` | **Layer 22**, 16K. `weights_path`: `layer_22/width_16k/average_l0_72/params.npz`. |
+| `archive/configs/targets/gemma2_2b_gemmascope_layer24.yaml` | **Layer 24**, 16K. `weights_path`: `layer_24/width_16k/average_l0_73/params.npz`. |
 
 | Paper | Why |
 |-------|-----|
@@ -101,4 +101,4 @@ This document lists **every code/config change** made to align our SAE steering 
 - **CorrSteer / Teammate PDF** → max-pooling option (Tier 2).
 - **Teammate PDF** → multi-feature steering (Tier 2), wider SAE + later-layer configs (Tier 3).
 
-The main write-up that compares our pipeline to Arad et al. and gives full pipeline commands is **`steering_arad_vs_phase2.md`** (root). This file is the **change log + paper mapping** so you can cite and justify each modification.
+The main write-up that compares our pipeline to Arad et al. and gives full pipeline commands is **`archive/notes/steering_arad_vs_phase2.md`**. This file is the **change log + paper mapping** so you can cite and justify each modification.

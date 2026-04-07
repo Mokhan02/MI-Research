@@ -19,8 +19,8 @@ This means:
   - Coherent compliance → coherence≈1, keyword≈0  → soft≈0.0
   - Degenerate text    → coherence≈0, any keyword → soft≈0.5
 
-Usage:
-    python scripts/rescore_soft.py \
+Usage (from repository root):
+    PYTHONPATH=. python archive/scripts/utilities/rescore_soft.py \
         --run_dir outputs/phase2_fullrun \
         --out_dir outputs/phase2_fullrun_soft
 

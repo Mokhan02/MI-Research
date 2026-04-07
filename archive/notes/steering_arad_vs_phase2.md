@@ -2,7 +2,7 @@
 
 This note explains how Arad et al. (“SAEs Are Good for Steering – If You Select the Right Features” [`arxiv.org/pdf/2505.20063`](https://arxiv.org/pdf/2505.20063)) implement SAE-based steering on Gemma-2, how that differs from the current `phase2_run.py` setup, and what concrete changes are needed to match their setup more closely.
 
-**For a single list of all changes with the paper/source and rationale for each, see [docs/steering_changes_and_papers.md](docs/steering_changes_and_papers.md).**
+**For a single list of all changes with the paper/source and rationale for each, see [docs/steering_changes_and_papers.md](../../docs/steering_changes_and_papers.md).**
 
 ---
 
@@ -332,9 +332,9 @@ uv run python scripts/phase2_run.py \
 
 ### 6.7 Config variants for wider SAE / later layers (implemented)
 
-Three new config files for ablation studies. The `weights_path` (average_l0_*) values have been verified against [google/gemma-scope-2b-pt-res](https://huggingface.co/google/gemma-scope-2b-pt-res) on HuggingFace:
+Three new config files for ablation studies (checked in under **`archive/configs/targets/`**). The `weights_path` (average_l0_*) values have been verified against [google/gemma-scope-2b-pt-res](https://huggingface.co/google/gemma-scope-2b-pt-res) on HuggingFace:
 
-| Config | Layer | Width | weights_path (verified) |
+| Config (under `archive/configs/targets/`) | Layer | Width | weights_path (verified) |
 |--------|-------|-------|-------------------------|
 | `gemma2_2b_gemmascope_res65k.yaml` | 20 | 65K | `layer_20/width_65k/average_l0_61/params.npz` |
 | `gemma2_2b_gemmascope_layer22.yaml` | 22 | 16K | `layer_22/width_16k/average_l0_72/params.npz` |
@@ -385,7 +385,7 @@ uv run python scripts/phase2_run.py \
 
 # 5. Layer ablation (repeat steps 1-3 with different configs)
 uv run python scripts/phase2_select_contrast.py \
-  --config configs/targets/gemma2_2b_gemmascope_layer22.yaml \
+  --config archive/configs/targets/gemma2_2b_gemmascope_layer22.yaml \
   --domain salad --out_dir outputs/phase2_select_salad_l22 --top-k 100 \
   --scoring composite --pooling max
 # ... then output scores + steering run with layer22 config

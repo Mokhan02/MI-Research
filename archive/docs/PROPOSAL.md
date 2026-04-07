@@ -128,7 +128,7 @@
 | Phase 2 steerability | `phase2_run.py` | α-grid, T, α*, censoring |
 | Phase 3 prediction | `phase3_predictability.py`, `phase3_predict_cv*.py` | Correlate metrics with α* |
 | Phase 4 off-target | `04_offtarget.py` | At α* and at fixed α₀ |
-| Alignment / geometry | `compute_alignment_mean_target.py` | cos(w_dec, u_target) — optional add-on |
+| Alignment / geometry | `archive/scripts/utilities/compute_alignment_mean_target.py` | cos(w_dec, u_target) — optional add-on |
 | Data/splits | `make_domain_splits.py`, `make_phase2_csvs.py` | Select / alpha / holdout; targets |
 | Feature selection | `phase2_select_contrast.py` | Contrast (task − neutral); controls |
 

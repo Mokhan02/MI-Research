@@ -131,7 +131,7 @@ uv run python scripts/phase2_run.py \
 - **3. Re-score with updated refusal scorer (no GPU)**
 
 ```bash
-uv run python scripts/rescore_pilot.py --run_dir outputs/phase2_salad_full
+PYTHONPATH=. python archive/scripts/utilities/rescore_pilot.py --run_dir outputs/phase2_salad_full
 ```
 
 - **4. Phase 3 analysis**
@@ -147,5 +147,5 @@ uv run python scripts/phase3_predictability.py \
 - **5. Check feature overlap with pilot**
 
 ```bash
-python3 scripts/check_feature_overlap.py
+PYTHONPATH=. python archive/scripts/utilities/check_feature_overlap.py
 ```

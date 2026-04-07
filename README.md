@@ -38,7 +38,7 @@ See **Steps 3–4** and **Output structure**.
 
 ## Style
 
-Keep code readable: prefer descriptive names (`dataset`, `prompt`, `feature_index`) over cryptic abbreviations, keep config-driven behavior explicit, and do not rely on `scripts/legacy/` or `archive/` for new work — those paths are reference-only.
+Keep code readable: prefer descriptive names (`dataset`, `prompt`, `feature_index`) over cryptic abbreviations, keep config-driven behavior explicit, and treat **`archive/`** as reference-only (old data, configs, utilities, notes). The supported pipeline lives under `scripts/` at the repository root.
 
 ---
 
@@ -60,6 +60,7 @@ Omit `--config` to run the synthetic-only branch.
 |----------|------|
 | `data/prompts/salad_alpha.csv` | Task prompts for refusal (SALADBench-derived); produced by `prepare_salad_bench.py` |
 | Neutral / control prompts | Used inside contrast selection (`phase2_select_contrast.py`) — must be structurally comparable to task prompts (see **Run gates**) |
+| Legacy domain CSVs (planets/capitals/neutral, xdom) | Moved to **`archive/data/legacy/`** — not used by the SALAD pipeline |
 
 ---
 
@@ -330,7 +331,7 @@ Before a full paper run, work through **[archive/docs/GATES.md](archive/docs/GAT
 
 For common analysis traps (τ_act, token span, pre-registration, controls), see **[archive/docs/LANDMINES.md](archive/docs/LANDMINES.md)**.
 
-**Do not use `scripts/legacy/` for production results** — old pipeline with non-production stubs; kept for reference only.
+**Do not use archived scripts or datasets for production results** — see **`archive/README.md`** for what lives there and why.
 
 ---
 
