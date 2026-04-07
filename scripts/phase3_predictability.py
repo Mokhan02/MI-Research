@@ -276,10 +276,13 @@ import torch
 @torch.no_grad()
 def compute_baseline_usage(
     model, tokenizer, W_enc: torch.Tensor, b_enc: torch.Tensor, thr: torch.Tensor,
-    prompts: list, device,
+    prompts: list, device, layer_idx: int,
 ) -> tuple:
     """Returns (act_freq, mean_act, mean_z_minus_thr, raw_activations).
-    W_enc: (d_model, n_feats) or (n_feats, d_model)."""
+    W_enc: (d_model, n_feats) or (n_feats, d_model).
+    Reads the residual stream at the SAE layer (resid_post of layer_idx),
+    which corresponds to hidden_states[layer_idx + 1] in HF transformers
+    (hidden_states[0] is the embedding, hidden_states[i+1] is the output of layer i)."""
     n_feats = b_enc.shape[0]
     d_model = W_enc.shape[0] if W_enc.shape[0] != n_feats else W_enc.shape[1]
 
@@ -287,7 +290,7 @@ def compute_baseline_usage(
     for prompt in tqdm(prompts, desc="Baseline forwards"):
         inp = tokenizer(prompt, return_tensors="pt").to(device)
         out = model(**inp, output_hidden_states=True)
-        r = out.hidden_states[-1][0, -1, :].float().cpu().numpy()
+        r = out.hidden_states[layer_idx + 1][0, -1, :].float().cpu().numpy()
         resids.append(r)
     resids = np.stack(resids, axis=0)
 
@@ -795,6 +798,12 @@ def main():
     (output_dir / "plots").mkdir(parents=True, exist_ok=True)
     (output_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
+    # Load config once and derive censored alpha* fill from the steering grid maximum
+    from src.config import load_config, resolve_config
+    config = resolve_config(load_config(args.config), run_id="phase3")
+    alpha_star_max = float(max(config["steering"]["alpha_grid"]))
+    logger.info("Censored alpha* fill = %.4f (max of cfg.steering.alpha_grid)", alpha_star_max)
+
     # Initialize W&B (spec: sae-refusal-steering project)
     try:
         import subprocess as _sp
@@ -865,9 +874,9 @@ def main():
                 y_df = make_y_labels(merge)
                 merge["is_censored"] = y_df["is_censored"].values
             else:
-                # Infer: censored if alpha_star_best >= ALPHA_STAR_MAX
-                logger.info("Inferring is_censored from alpha_star_best >= %.1f", ALPHA_STAR_MAX)
-                merge["is_censored"] = merge["alpha_star_best"] >= ALPHA_STAR_MAX
+                # Infer: censored if alpha_star_best >= alpha_star_max (grid max)
+                logger.info("Inferring is_censored from alpha_star_best >= %.4f", alpha_star_max)
+                merge["is_censored"] = merge["alpha_star_best"] >= alpha_star_max
 
         # Check geometry columns
         available_geo = [m for m in GEOMETRY_METRICS if m in merge.columns]
@@ -888,7 +897,6 @@ def main():
     # MODE B: Compute from phase-2 outputs (original flow, preserved)
     # -----------------------------------------------------------------
     else:
-        from src.config import load_config, resolve_config
         from src.sae_loader import load_gemmascope_decoder
 
         if args.phase2_summary:
@@ -910,8 +918,7 @@ def main():
         logger.info("Y labels: alpha_star_best, tv_at_alpha_star_best, "
                      "success_best, monotone_best, is_censored")
 
-        # Load SAE
-        config = resolve_config(load_config(args.config), run_id="phase3")
+        # Load SAE (config was loaded above)
         _, meta = load_gemmascope_decoder(config)
         npz_path = meta["npz_path"]
         data = np.load(npz_path)
@@ -962,8 +969,9 @@ def main():
                     prompt_csv = str(Path(__file__).resolve().parents[1] / "data" / "prompts" / "salad_alpha.csv")
                 dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string"})
                 prompts = dfp["prompt"].dropna().astype(str).tolist()[: args.n_prompts]
+                layer_idx = int(config["sae"]["layer_idx"])
                 act_freq, mean_act, mean_z_minus_thr, raw_act = compute_baseline_usage(
-                    model, tokenizer, W_enc, b_enc, thr, prompts, device
+                    model, tokenizer, W_enc, b_enc, thr, prompts, device, layer_idx
                 )
                 usage_df = pd.DataFrame({
                     "feature_id": np.arange(n_feats_total),
@@ -1000,15 +1008,15 @@ def main():
     # -----------------------------------------------------------------
     merge["is_censored"] = merge["is_censored"].fillna(False).astype(bool)
 
-    # Assign censored features alpha*=10 (tied maximum rank)
+    # Assign censored features alpha* = grid max (tied maximum rank)
     censored_mask = merge["is_censored"]
     if censored_mask.any():
-        merge.loc[censored_mask, "alpha_star_best"] = ALPHA_STAR_MAX
-        logger.info("Assigned alpha*=%.1f to %d censored features",
-                     ALPHA_STAR_MAX, censored_mask.sum())
+        merge.loc[censored_mask, "alpha_star_best"] = alpha_star_max
+        logger.info("Assigned alpha*=%.4f to %d censored features",
+                     alpha_star_max, censored_mask.sum())
 
     # Compute log(alpha*)
-    merge["log_alpha_star"] = np.log1p(merge["alpha_star_best"].astype(float))
+    merge["log_alpha_star"] = np.log(merge["alpha_star_best"].astype(float))
 
     # -----------------------------------------------------------------
     # Run analyses

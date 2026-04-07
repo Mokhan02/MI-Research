@@ -10,7 +10,8 @@
       "Bash(find:*)",
       "Bash(uv sync:*)",
       "Bash(uv run:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''scripts/phase2_select_contrast.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
     ]
   }
 }

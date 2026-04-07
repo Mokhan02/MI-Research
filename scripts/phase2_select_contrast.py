@@ -200,8 +200,8 @@ def main():
     ap.add_argument("--token-span", type=str, default=None, choices=["last", "last_n", "all"])
     ap.add_argument("--scoring", type=str, default="composite", choices=["delta_freq", "composite"],
                     help="Scoring strategy: delta_freq (legacy) or composite (Bhargav & Zhu)")
-    ap.add_argument("--pooling", type=str, default="mean", choices=["mean", "max"],
-                    help="Token-level pooling: mean (legacy) or max (CorrSteer)")
+    ap.add_argument("--pooling", type=str, default="max", choices=["mean", "max"],
+                    help="Token-level pooling: max (CorrSteer, default) or mean (legacy)")
     ap.add_argument("--comp-w1", type=float, default=0.5, help="Composite weight on |norm_diff_mean|")
     ap.add_argument("--comp-w2", type=float, default=0.5, help="Composite weight on (1 - norm_variance)")
     ap.add_argument("--comp-min-score", type=float, default=0.0, help="Min composite score threshold")
@@ -279,6 +279,40 @@ def main():
     task_select = load_prompts_from_csv(prompts_dir / f"{args.domain}_select.csv")
     neutral_select = load_prompts_from_csv(prompts_dir / "neutral_select.csv")
     logger.info("Task (%s) select prompts: %d; neutral select prompts: %d", args.domain, len(task_select), len(neutral_select))
+
+    # Leakage check: select / alpha / holdout splits must be disjoint, both for
+    # the task domain and for the neutral set. We load whichever splits exist
+    # alongside the select CSVs and assert pairwise disjointness.
+    def _assert_splits_disjoint(label: str, splits: dict[str, list[str]]) -> None:
+        names = list(splits.keys())
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = names[i], names[j]
+                overlap = set(splits[a]) & set(splits[b])
+                if overlap:
+                    example = next(iter(overlap))
+                    raise AssertionError(
+                        f"Prompt-set leakage in {label}: {len(overlap)} prompts "
+                        f"appear in both '{a}' and '{b}' (e.g. {example!r})"
+                    )
+
+    def _load_split_group(label: str, select_prompts: list[str], stem: str) -> None:
+        splits = {"select": select_prompts}
+        for split_name in ("alpha", "holdout"):
+            p = prompts_dir / f"{stem}_{split_name}.csv"
+            if p.exists():
+                splits[split_name] = load_prompts_from_csv(p)
+            else:
+                logger.warning(
+                    "Leakage check (%s): %s split missing (%s); skipping that pair",
+                    label, split_name, p,
+                )
+        _assert_splits_disjoint(label, splits)
+        logger.info("Leakage check passed for %s: splits %s are pairwise disjoint",
+                    label, list(splits.keys()))
+
+    _load_split_group(f"task[{args.domain}]", task_select, args.domain)
+    _load_split_group("neutral", neutral_select, "neutral")
 
     logger.info("Loading model and SAE...")
     model, tokenizer = load_model(config)
