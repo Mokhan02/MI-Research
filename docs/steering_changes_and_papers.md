@@ -84,9 +84,9 @@ This document lists **every code/config change** made to align our SAE steering 
 
 | Where | What changed |
 |-------|----------------|
-| `archive/configs/targets/gemma2_2b_gemmascope_res65k.yaml` | Layer 20, **65K** features. `weights_path`: `layer_20/width_65k/average_l0_61/params.npz` (verified on HF). |
-| `archive/configs/targets/gemma2_2b_gemmascope_layer22.yaml` | **Layer 22**, 16K. `weights_path`: `layer_22/width_16k/average_l0_72/params.npz`. |
-| `archive/configs/targets/gemma2_2b_gemmascope_layer24.yaml` | **Layer 24**, 16K. `weights_path`: `layer_24/width_16k/average_l0_73/params.npz`. |
+| `configs/targets/gemma2_2b_gemmascope_res65k.yaml` | Layer 20, **65K** features. `weights_path`: `layer_20/width_65k/average_l0_61/params.npz` (verified on HF). |
+| `configs/targets/gemma2_2b_gemmascope_layer22.yaml` | **Layer 22**, 16K. `weights_path`: `layer_22/width_16k/average_l0_72/params.npz`. |
+| `configs/targets/gemma2_2b_gemmascope_layer24.yaml` | **Layer 24**, 16K. `weights_path`: `layer_24/width_16k/average_l0_73/params.npz`. |
 
 | Paper | Why |
 |-------|-----|

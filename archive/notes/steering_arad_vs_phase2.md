@@ -332,9 +332,9 @@ uv run python scripts/phase2_run.py \
 
 ### 6.7 Config variants for wider SAE / later layers (implemented)
 
-Three new config files for ablation studies (checked in under **`archive/configs/targets/`**). The `weights_path` (average_l0_*) values have been verified against [google/gemma-scope-2b-pt-res](https://huggingface.co/google/gemma-scope-2b-pt-res) on HuggingFace:
+Three new config files for ablation studies (under **`configs/targets/`**, alongside the main 16K layer-20 target). The `weights_path` (average_l0_*) values have been verified against [google/gemma-scope-2b-pt-res](https://huggingface.co/google/gemma-scope-2b-pt-res) on HuggingFace:
 
-| Config (under `archive/configs/targets/`) | Layer | Width | weights_path (verified) |
+| Config | Layer | Width | weights_path (verified) |
 |--------|-------|-------|-------------------------|
 | `gemma2_2b_gemmascope_res65k.yaml` | 20 | 65K | `layer_20/width_65k/average_l0_61/params.npz` |
 | `gemma2_2b_gemmascope_layer22.yaml` | 22 | 16K | `layer_22/width_16k/average_l0_72/params.npz` |
@@ -385,7 +385,7 @@ uv run python scripts/phase2_run.py \
 
 # 5. Layer ablation (repeat steps 1-3 with different configs)
 uv run python scripts/phase2_select_contrast.py \
-  --config archive/configs/targets/gemma2_2b_gemmascope_layer22.yaml \
+  --config configs/targets/gemma2_2b_gemmascope_layer22.yaml \
   --domain salad --out_dir outputs/phase2_select_salad_l22 --top-k 100 \
   --scoring composite --pooling max
 # ... then output scores + steering run with layer22 config

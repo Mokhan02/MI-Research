@@ -309,6 +309,11 @@ YAML configs live under `configs/` and inherit from `configs/base.yaml`.
 |--------|-----|
 | `configs/targets/gemma2_2b_gemmascope_res16k.yaml` | Gemma-2-2b-it + GemmaScope res-16k, layer 20 (primary) |
 | `configs/targets/gemma2_2b_base_gemmascope_res16k.yaml` | Base model variant |
+| `configs/targets/gemma2_2b_gemmascope_res65k.yaml` | Same model, layer 20, **65K** SAE width (ablation) |
+| `configs/targets/gemma2_2b_gemmascope_layer22.yaml` | Layer **22**, 16K (ablation) |
+| `configs/targets/gemma2_2b_gemmascope_layer24.yaml` | Layer **24**, 16K (ablation) |
+| `configs/targets/gemma2_9b_gemmascope_layer20.yaml` | Gemma 2 9B, layer 20 SAE |
+| `configs/targets/gemma2_9b_gemmascope_layer36.yaml` | Gemma 2 9B, layer 36 SAE |
 
 ---
 
