@@ -142,12 +142,16 @@ def main():
 
     final_norm = model.model.norm
     lm_head = model.lm_head
-    print("Computing logit lens top-k for all features...")
-    ll_topk = compute_logit_lens_topk(W_dec, final_norm, lm_head, k=args.logit_lens_k)
+    print("Computing logit lens top-k for candidate features only...")
+    # Subset to candidates before the lm_head projection to avoid OOM on wide SAEs
+    # (e.g. 65k × 256k vocab in float32 would be ~67 GB; 300 × 256k is negligible)
+    W_dec_candidates = W_dec[feature_ids]  # (n_candidates, d_model)
+    ll_topk_candidates = compute_logit_lens_topk(W_dec_candidates, final_norm, lm_head, k=args.logit_lens_k)
+    fid_to_local = {fid: i for i, fid in enumerate(feature_ids)}
 
     scores = {}
     for fid in tqdm(feature_ids, desc="Output scores"):
-        ll_indices = ll_topk[fid].tolist()
+        ll_indices = ll_topk_candidates[fid_to_local[fid]].tolist()
         score = compute_output_score(
             model, tokenizer, layer_idx, fid, ll_indices,
             args.neutral_prompt, W_dec, W_enc, b_enc, thr,
