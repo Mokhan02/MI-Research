@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 
 from src.config import load_config, resolve_config
 from src.model_utils import load_model
-from src.sae_loader import load_gemmascope_decoder
+from src.sae_loader import load_gemmascope_decoder, load_sae_full
 from src.refusal_scorer import refusal_score as _refusal_score
 
 # --------------------------
@@ -115,6 +115,76 @@ def make_steer_prehook(model, layer_idx: int, alpha: float, pos: int, steer_dir:
         layer = model.model.layers[layer_idx]
         return layer.register_forward_pre_hook(_prehook)
     return _mk, ran
+
+# ------------------------------------------------------------------
+# Activation-scaled steering (Arad et al., 2025)
+#
+# For JumpReLU SAEs:
+#   a_max = max(relu(resid @ W_enc + b_enc - threshold))
+# For BatchTopK SAEs (no per-feature threshold):
+#   a_max = max(relu(resid @ W_enc + b_enc))
+#
+# Intervention: resid += alpha * a_max * W_dec[fid]
+# ------------------------------------------------------------------
+
+def _compute_a_max(resid_vec: torch.Tensor, W_enc: torch.Tensor,
+                   b_enc: torch.Tensor, threshold: torch.Tensor | None = None) -> torch.Tensor:
+    """SAE encode a single residual vector and return max activation (scalar).
+
+    threshold: per-feature threshold (JumpReLU). If None (BatchTopK), skip subtraction.
+    """
+    z = resid_vec @ W_enc + b_enc          # (n_features,)
+    if threshold is not None:
+        z = z - threshold
+    act = torch.relu(z)
+    return act.max()
+
+
+def make_steer_prehook_amax(model, layer_idx: int, alpha: float, pos: int,
+                            steer_dir: torch.Tensor, W_enc: torch.Tensor,
+                            b_enc: torch.Tensor, threshold: torch.Tensor | None = None):
+    """Activation-scaled steering at a single position (logit mode)."""
+    ran = {"ok": False, "a_max_values": []}
+    def _mk():
+        ran["a_max_values"].clear()
+        def _prehook(module, inputs):
+            hidden = inputs[0]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            resid = hidden2[0, pos, :].float()
+            a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+            ran["a_max_values"].append(float(a_max.item()))
+            hidden2[0, pos, :] = hidden2[0, pos, :] + alpha * a_max * steer_dir
+            return (hidden2,) + inputs[1:]
+        layer = model.model.layers[layer_idx]
+        return layer.register_forward_pre_hook(_prehook)
+    return _mk, ran
+
+
+def make_steer_prehook_amax_lastpos(model, layer_idx: int, alpha: float,
+                                    steer_dir: torch.Tensor, W_enc: torch.Tensor,
+                                    b_enc: torch.Tensor, threshold: torch.Tensor | None = None):
+    """Activation-scaled steering at the last token only (for generation).
+
+    Per batch row: each sequence gets its own a_max from its last-token residual.
+    """
+    ran = {"ok": False, "a_max_values": []}
+    def _mk():
+        ran["a_max_values"].clear()
+        def _prehook(module, inputs):
+            hidden = inputs[0]  # (batch, seq, d_model)
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            for b in range(hidden2.shape[0]):
+                resid = hidden2[b, -1, :].float()
+                a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+                ran["a_max_values"].append(float(a_max.item()))
+                hidden2[b, -1, :] = hidden2[b, -1, :] + alpha * a_max * steer_dir
+            return (hidden2,) + inputs[1:]
+        layer = model.model.layers[layer_idx]
+        return layer.register_forward_pre_hook(_prehook)
+    return _mk, ran
+
 
 def encode_target(tokenizer, t):
     if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t.strip() == ""):
@@ -336,6 +406,10 @@ def main():
     ap.add_argument("--resume", action="store_true", help="Skip tasks already in run_rows.csv")
     ap.add_argument("--micro_sweep", action="store_true",
                     help="Micro sweep: 10 features, 25 prompts, alpha=[0,.5,1,2,5]. Run this before full K=100.")
+    ap.add_argument("--no_amax", action="store_true",
+                    help="Use vanilla fixed-vector steering (alpha * W_dec[f]) instead of "
+                         "activation-scaled steering (alpha * a_max * W_dec[f]). "
+                         "Run as control condition to isolate the a_max confound.")
     args = ap.parse_args()
 
     if args.micro_sweep:
@@ -401,12 +475,26 @@ def main():
     model.eval()
     device = next(model.parameters()).device
 
-    # Load SAE decoder (use returned tensor so NPZ key name is not assumed)
-    W_dec, _ = load_gemmascope_decoder(config)
-    W_dec = W_dec.to(device=device, dtype=torch.float32)
+    # Load SAE weights
+    use_amax = not args.no_amax
+    if use_amax:
+        sae_all = load_sae_full(config)
+        W_dec = sae_all["W_dec"].to(device=device, dtype=torch.float32)
+        W_enc = sae_all["W_enc"].to(device=device, dtype=torch.float32)
+        b_enc = sae_all["b_enc"].to(device=device, dtype=torch.float32)
+        threshold = sae_all["threshold"]
+        if threshold is not None:
+            threshold = threshold.to(device=device, dtype=torch.float32)
+        has_thr = threshold is not None
+        print(f"[Arad-style] W_dec={W_dec.shape}, W_enc={W_enc.shape}, b_enc={b_enc.shape}, "
+              f"threshold={'per-feature' if has_thr else 'None (BatchTopK)'}")
+    else:
+        W_dec, _ = load_gemmascope_decoder(config)
+        W_dec = W_dec.to(device=device, dtype=torch.float32)
+        W_enc = b_enc = threshold = None
+        print(f"[Vanilla] W_dec: {W_dec.shape} (--no_amax: no encoder loaded)")
     if config.get("sae", {}).get("normalize_decoder", False):
         W_dec = W_dec / (W_dec.norm(dim=1, keepdim=True).clamp(min=1e-12))
-    print(f"W_dec: {W_dec.shape}")
 
     # Choose features (fixed set > txt file > random sampling)
     n_feats_total = W_dec.shape[0]
@@ -435,17 +523,23 @@ def main():
 
     alphas_sorted = sorted(alphas, key=lambda a: abs(a))
 
+    sae_enc = {"W_enc": W_enc, "b_enc": b_enc, "threshold": threshold, "use_amax": use_amax}
+
     if args.mode == "logit":
-        _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config)
+        _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc)
     else:
-        _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config)
+        _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc)
 
 
 # ===========================================================
 # Logit mode (factual QA: delta_logit_target)
 # ===========================================================
-def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
+def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc):
     device = next(model.parameters()).device
+    use_amax = sae_enc["use_amax"]
+    W_enc = sae_enc["W_enc"]
+    b_enc = sae_enc["b_enc"]
+    threshold = sae_enc["threshold"]
 
     lm_head_w = model.lm_head.weight.detach().float()  # [vocab, d_model]
 
@@ -492,12 +586,24 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             steer_logits = pc["base_logits"]
             steer_resid = pc["base_resid"]
             hook_ran = True
+            a_max_val = 0.0
+        elif use_amax:
+            mk_hook, cap = make_steer_prehook_amax(model, args.layer, alpha, pc["pos"],
+                                                    steer_dir, W_enc, b_enc, threshold)
+            t0 = time.time()
+            steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
+            t1 = time.time()
+            hook_ran = cap["ok"]
+            a_max_val = cap["a_max_values"][0] if cap["a_max_values"] else 0.0
+            if (t1 - t0) > 2.0:
+                print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
         else:
             mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pc["pos"], steer_dir)
             t0 = time.time()
             steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
             t1 = time.time()
             hook_ran = cap["ok"]
+            a_max_val = 1.0  # sentinel: no scaling
             if (t1 - t0) > 2.0:
                 print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
 
@@ -524,6 +630,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             "hook_ran": bool(hook_ran),
             "base_rank": base_rank, "steer_rank": steer_rank,
             "target_is_top1": target_is_top1,
+            "a_max": a_max_val,
         }
         buffer.append(row)
         completed_this_session += 1
@@ -615,7 +722,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
 # ===========================================================
 # Refusal mode (SALADBench: generate + keyword refusal scoring)
 # ===========================================================
-def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config):
+def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc):
     """
     For each (prompt, feature, alpha):
       1. Generate a short response with steering applied at all positions.
@@ -623,6 +730,10 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     alpha* = smallest |alpha| where refusal_rate drops below baseline by T.
     """
     device = next(model.parameters()).device
+    use_amax = sae_enc["use_amax"]
+    W_enc = sae_enc["W_enc"]
+    b_enc = sae_enc["b_enc"]
+    threshold = sae_enc["threshold"]
     max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
 
     print(f"[Refusal mode] Computing baseline generations for {len(dfp)} prompts...")
@@ -660,6 +771,11 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
         if alpha == 0.0:
             gen_text = br["base_text"]
             hook_ran = True
+        elif use_amax:
+            mk_hook, cap = make_steer_prehook_amax_lastpos(model, args.layer, alpha,
+                                                            steer_dir, W_enc, b_enc, threshold)
+            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=True)
+            hook_ran = cap["ok"]
         else:
             mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
             gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=True)

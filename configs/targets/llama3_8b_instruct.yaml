@@ -1,8 +1,9 @@
-# Llama 3.1 8B Instruct + Llama Scope SAE (OpenMOSS L16R-8x)
+# Llama 3.1 8B Instruct + andyrdt BatchTopK SAE
 #
 # Model: meta-llama/Llama-3.1-8B-Instruct
-# SAE: OpenMOSS-Team/Llama3_1-8B-Base-LXR-8x (layer 16, 8x expansion = 32k features)
-# Layer: 16 (middle)
+# SAE: andyrdt/saes-llama-3.1-8b-instruct (BatchTopK, 32x expansion = 131k features)
+# Layer: 15 (middle; available layers: 3, 7, 11, 15, 19, 23, 27)
+# Trainer: trainer_0 (seed 0, k=32)
 
 model:
   model_id: "meta-llama/Llama-3.1-8B-Instruct"
@@ -13,15 +14,15 @@ model:
   do_sample: false
 
 sae:
-  source: "llamascope"
-  sae_set: "Llama3_1-8B-Base-L16R-8x"
-  sae_id: "16-llamascope-32k"
-  layer_idx: 16
-  hook_point: "blocks.16.hook_resid_post"
+  source: "andyrdt"
+  sae_set: "andyrdt-batchtopk-32x"
+  sae_id: "15-andyrdt-131k"
+  layer_idx: 15
+  hook_point: "blocks.15.hook_resid_post"
   normalize_decoder: true
-  weights_repo: "OpenMOSS-Team/Llama3_1-8B-Base-LXR-8x"
-  weights_path: "Llama3_1-8B-Base-L16R-8x/checkpoints/final.safetensors"
-  n_features_total: 32768
+  weights_repo: "andyrdt/saes-llama-3.1-8b-instruct"
+  weights_path: "resid_post_layer_15/trainer_0/ae.pt"
+  n_features_total: 131072
 
 architecture:
   d_model: 4096
@@ -29,7 +30,9 @@ architecture:
   vocab_size: 128256
 
 sae_specs:
-  decoder_shape: [32768, 4096]
+  decoder_shape: [131072, 4096]
+  sae_type: "BatchTopK"
+  k: 32
 
 features:
   n_features: 300
@@ -56,6 +59,6 @@ generation:
   max_new_tokens: 64
 
 experiment:
-  name: "llama3-8b-instruct-llamascope-layer16"
+  name: "llama3-8b-instruct-andyrdt-layer15"
   seed: 42
   phase: 1

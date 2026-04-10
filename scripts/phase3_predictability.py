@@ -798,7 +798,7 @@ def main():
     # -----------------------------------------------------------------
     else:
         from src.config import load_config, resolve_config
-        from src.sae_loader import load_gemmascope_decoder
+        from src.sae_loader import load_gemmascope_decoder, load_sae_full
 
         if args.phase2_summary:
             summary_path = Path(args.phase2_summary)
@@ -870,39 +870,58 @@ def main():
                 model, tokenizer = load_model(config)
                 model.eval()
                 device = next(model.parameters()).device
-                W_enc = torch.tensor(np.asarray(data["W_enc"], dtype=np.float32), device=device)
-                b_enc = torch.tensor(np.asarray(data["b_enc"], dtype=np.float32), device=device)
-                thr = torch.tensor(np.asarray(data["threshold"], dtype=np.float32), device=device)
-                if W_enc.shape[0] != d_model:
-                    W_enc = W_enc.T
-                prompt_csv = args.prompt_csv or "data/prompts/salad_alpha.csv"
-                if not Path(prompt_csv).exists():
-                    prompt_csv = str(Path(__file__).resolve().parents[1] / "data" / "prompts" / "salad_alpha.csv")
-                dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string"})
-                prompts = dfp["prompt"].dropna().astype(str).tolist()[: args.n_prompts]
-                act_freq, mean_act, mean_z_minus_thr, raw_act = compute_baseline_usage(
-                    model, tokenizer, W_enc, b_enc, thr, prompts, device
-                )
-                usage_df = pd.DataFrame({
-                    "feature_id": np.arange(n_feats_total),
-                    "act_freq": act_freq,
-                    "mean_act": mean_act,
-                    "mean_z_minus_thr": mean_z_minus_thr,
-                })
-                usage_df.to_csv(cache_path, index=False)
-                logger.info("Saved baseline usage -> %s", cache_path)
+                sae_all = load_sae_full(config)
+                W_enc = sae_all["W_enc"]
+                b_enc = sae_all["b_enc"]
+                thr = sae_all["threshold"]
+                if W_enc is None or b_enc is None:
+                    logger.warning("SAE encoder weights not available; skipping baseline usage")
+                    usage_df = pd.DataFrame({
+                        "feature_id": np.arange(n_feats_total),
+                        "act_freq": np.nan, "mean_act": np.nan, "mean_z_minus_thr": np.nan,
+                    })
+                    geo_df["coactivation_correlation"] = np.nan
+                    # skip the rest of the baseline block
+                    W_enc = b_enc = thr = None
+                if W_enc is not None:
+                    W_enc = W_enc.to(device=device, dtype=torch.float32)
+                    b_enc = b_enc.to(device=device, dtype=torch.float32)
+                    if thr is not None:
+                        thr = thr.to(device=device, dtype=torch.float32)
+                    else:
+                        # BatchTopK: no per-feature threshold, use zeros
+                        thr = torch.zeros(b_enc.shape[0], device=device, dtype=torch.float32)
+                    if W_enc.shape[0] != d_model:
+                        W_enc = W_enc.T
+                if W_enc is not None:
+                    prompt_csv = args.prompt_csv or "data/prompts/salad_alpha.csv"
+                    if not Path(prompt_csv).exists():
+                        prompt_csv = str(Path(__file__).resolve().parents[1] / "data" / "prompts" / "salad_alpha.csv")
+                    dfp = pd.read_csv(prompt_csv, dtype={"prompt": "string"})
+                    prompts = dfp["prompt"].dropna().astype(str).tolist()[: args.n_prompts]
+                    act_freq, mean_act, mean_z_minus_thr, raw_act = compute_baseline_usage(
+                        model, tokenizer, W_enc, b_enc, thr, prompts, device
+                    )
+                    usage_df = pd.DataFrame({
+                        "feature_id": np.arange(n_feats_total),
+                        "act_freq": act_freq,
+                        "mean_act": mean_act,
+                        "mean_z_minus_thr": mean_z_minus_thr,
+                    })
+                    usage_df.to_csv(cache_path, index=False)
+                    logger.info("Saved baseline usage -> %s", cache_path)
 
-                # Compute coactivation from raw activations
-                logger.info("Computing coactivation correlation from baseline activations")
-                feature_ids_arr = np.array(feature_ids)
-                coact_vals = compute_coactivation_chunked(
-                    raw_act, feature_ids_arr, topk=args.topk)
-                # Map to full geo_df: only computed for features in summary
-                coact_full = np.full(n_feats_total, np.nan, dtype=np.float32)
-                for idx_i, fid in enumerate(feature_ids_arr):
-                    if 0 <= fid < n_feats_total:
-                        coact_full[fid] = coact_vals[idx_i]
-                geo_df["coactivation_correlation"] = coact_full
+                    # Compute coactivation from raw activations
+                    logger.info("Computing coactivation correlation from baseline activations")
+                    feature_ids_arr = np.array(feature_ids)
+                    coact_vals = compute_coactivation_chunked(
+                        raw_act, feature_ids_arr, topk=args.topk)
+                    # Map to full geo_df: only computed for features in summary
+                    coact_full = np.full(n_feats_total, np.nan, dtype=np.float32)
+                    for idx_i, fid in enumerate(feature_ids_arr):
+                        if 0 <= fid < n_feats_total:
+                            coact_full[fid] = coact_vals[idx_i]
+                    geo_df["coactivation_correlation"] = coact_full
 
         # Merge: only features in summary
         merge = summary[["feature_id"]].copy()
