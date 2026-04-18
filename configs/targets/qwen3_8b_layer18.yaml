@@ -1,0 +1,76 @@
+# Qwen3-8B with adamkarvonen BatchTopK SAEs — Layer 18
+#
+# Model: Qwen/Qwen3-8B
+# SAE:   adamkarvonen/qwen3-8b-saes  (dictionary_learning BatchTopK, .pt format)
+# Layer: 18 out of 36 (~50% depth)
+#
+# Available layers: 9 (~25%), 18 (~50%), 27 (~75%).
+# Starting with L18 as the proportional-depth match to 9B L20 (~48%) and 27B L22 (~48%).
+#
+# Trainer options at each layer:
+#   trainer_0: 16k width, l0=80
+#   trainer_1: 16k width, l0=160
+#   trainer_2: 65k width, l0=80
+#   trainer_3: 65k width, l0=160
+# Using trainer_0 (16k, l0=80) to match the 16k GemmaScope conditions.
+#
+# NOTE: SAE weights are .pt files (dictionary_learning format), not NPZ.
+# sae_loader.py dispatches on file extension — no other code changes needed.
+# SAE training note: high activations (10x median) were filtered during training
+# to handle Qwen's attention sink phenomenon.
+
+model:
+  model_id: "Qwen/Qwen3-8B"
+  device: "auto"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "adamkarvonen"
+  sae_set: "qwen3-8b-batch-topk-16k"
+  sae_id: "18-qwen3-8b-batch-topk-16k-l080"
+  layer_idx: 18
+  hook_point: "blocks.18.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "adamkarvonen/qwen3-8b-saes"
+  weights_path: "saes_Qwen_Qwen3-8B_batch_top_k/resid_post_layer_18/trainer_0/ae.pt"
+  n_features_total: 16384
+
+architecture:
+  d_model: 4096
+  n_layers: 36
+  vocab_size: 151936
+
+sae_specs:
+  decoder_shape: [16384, 4096]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features_qwen3_8b_l18.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+steering:
+  alpha_grid: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "qwen3-8b-batch-topk-16k-layer18"
+  seed: 42
+  phase: 2

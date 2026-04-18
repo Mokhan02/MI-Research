@@ -37,6 +37,29 @@ def _find_npz_key(data, canonical: str) -> str | None:
     return None
 
 
+def download_sae_weights(repo_id: str, file_path: str, cache_dir: str | None = None) -> str:
+    """
+    Download SAE weights file (NPZ or PT) from HuggingFace Hub; return local path.
+
+    Args:
+        repo_id: HuggingFace repo (e.g. adamkarvonen/qwen3-8b-saes).
+        file_path: Path within repo (e.g. saes_.../resid_post_layer_18/trainer_0/ae.pt).
+        cache_dir: Optional cache directory.
+
+    Returns:
+        Absolute path to the downloaded file on disk.
+    """
+    from huggingface_hub import hf_hub_download
+
+    local_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=file_path,
+        cache_dir=cache_dir,
+    )
+    logger.info(f"Downloaded SAE weights: {repo_id}/{file_path} -> {local_path}")
+    return local_path
+
+
 def download_sae_npz(repo_id: str, file_path: str, cache_dir: str | None = None) -> str:
     """
     Download params.npz from HuggingFace Hub into cache; return local file path.
@@ -139,19 +162,77 @@ def load_decoder_from_npz(
     return out, chosen_key, transposed
 
 
+def load_decoder_from_pt(
+    pt_path: str,
+    n_features_total: int,
+    d_model: int,
+) -> Tuple[torch.Tensor, str, bool]:
+    """
+    Load decoder from a dictionary_learning-style ae.pt file.
+
+    The raw state dict uses key 'decoder.weight' with shape (n_features, d_model)
+    or (d_model, n_features). Returns (decoder, chosen_key, transposed) in the
+    same contract as load_decoder_from_npz.
+
+    Raises:
+        ValueError: If no suitable decoder tensor is found.
+    """
+    state = torch.load(pt_path, map_location="cpu", weights_only=True)
+
+    # Prefer 'decoder.weight'; fall back to any 2-D tensor matching the shape
+    chosen_key = None
+    for k in ("decoder.weight", "W_dec", "decoder"):
+        if k in state:
+            chosen_key = k
+            break
+
+    if chosen_key is None:
+        candidates = [k for k, v in state.items() if isinstance(v, torch.Tensor) and v.dim() == 2]
+        for k in candidates:
+            s = state[k].shape
+            if set(s) == {n_features_total, d_model} or (n_features_total in s and d_model in s):
+                chosen_key = k
+                break
+
+    if chosen_key is None:
+        raise ValueError(
+            f"No decoder tensor found in PT state dict. Keys: {list(state.keys())}. "
+            f"Expected a 2-D tensor with dims {n_features_total} and {d_model}."
+        )
+
+    arr = state[chosen_key].to(torch.float32)
+    transposed = False
+    if arr.shape == (d_model, n_features_total):
+        arr = arr.T
+        transposed = True
+    elif arr.shape != (n_features_total, d_model):
+        raise ValueError(
+            f"Decoder shape {tuple(arr.shape)} is not ({n_features_total}, {d_model}) "
+            f"nor ({d_model}, {n_features_total}). Key={chosen_key}."
+        )
+
+    logger.info(f"PT decoder loaded: key={chosen_key}, shape={tuple(arr.shape)}, transposed={transposed}")
+    assert arr.shape == (n_features_total, d_model)
+    return arr, chosen_key, transposed
+
+
 def load_gemmascope_decoder(cfg: dict) -> Tuple[torch.Tensor, dict]:
     """
-    Load GemmaScope decoder from config: download NPZ, load decoder, assert shape.
+    Load SAE decoder from config. Supports NPZ (GemmaScope) and PT (dictionary_learning) formats.
+
+    Dispatches on the file extension of cfg.sae.weights_path:
+        .npz  -> download_sae_npz + load_decoder_from_npz  (existing path, unchanged)
+        .pt   -> download_sae_weights + load_decoder_from_pt
 
     Reads:
         cfg.sae.weights_repo
-        cfg.sae.weights_path (required; add to config if missing)
+        cfg.sae.weights_path
         cfg.sae.n_features_total
-        cfg.architecture.d_model (required; no hardcode)
+        cfg.architecture.d_model
 
     Returns:
         decoder: (n_features_total, d_model) float32 on CPU.
-        metadata: dict with npz_keys, chosen_key, transposed, decoder_shape.
+        metadata: dict with weights_path, chosen_key, transposed, decoder_shape.
     """
     sae = cfg.get("sae", {})
     sae_id = sae.get("sae_id")
@@ -176,25 +257,42 @@ def load_gemmascope_decoder(cfg: dict) -> Tuple[torch.Tensor, dict]:
         raise ValueError("cfg.architecture.d_model is required (or load model and use model.config.hidden_size)")
 
     cache_dir = sae.get("cache_dir")
-    npz_path = download_sae_npz(repo_id, file_path, cache_dir=cache_dir)
+    ext = file_path.rsplit(".", 1)[-1].lower()
 
-    decoder, chosen_key, transposed = load_decoder_from_npz(npz_path, n_features_total, d_model)
-    assert decoder.shape[0] == n_features_total and decoder.shape[1] == d_model, (
+    if ext == "pt":
+        local_path = download_sae_weights(repo_id, file_path, cache_dir=cache_dir)
+        decoder, chosen_key, transposed = load_decoder_from_pt(local_path, n_features_total, d_model)
+        state_keys = list(torch.load(local_path, map_location="cpu", weights_only=True).keys())
+        metadata = {
+            "weights_path": local_path,
+            "weights_format": "pt",
+            "state_keys": state_keys,
+            "chosen_key": chosen_key,
+            "transposed": transposed,
+            "decoder_shape": list(decoder.shape),
+            "n_features_total": n_features_total,
+            "d_model": d_model,
+        }
+    else:
+        # NPZ path — unchanged
+        npz_path = download_sae_npz(repo_id, file_path, cache_dir=cache_dir)
+        decoder, chosen_key, transposed = load_decoder_from_npz(npz_path, n_features_total, d_model)
+        data = np.load(npz_path)
+        metadata = {
+            "weights_path": npz_path,
+            "weights_format": "npz",
+            "npz_path": npz_path,  # kept for backwards compat
+            "npz_keys": list(data.keys()),
+            "chosen_key": chosen_key,
+            "transposed": transposed,
+            "decoder_shape": list(decoder.shape),
+            "n_features_total": n_features_total,
+            "d_model": d_model,
+        }
+
+    assert decoder.shape == (n_features_total, d_model), (
         f"Expected ({n_features_total}, {d_model}), got {decoder.shape}"
     )
-
-    data = np.load(npz_path)
-    npz_keys = list(data.keys())
-
-    metadata = {
-        "npz_path": npz_path,
-        "npz_keys": npz_keys,
-        "chosen_key": chosen_key,
-        "transposed": transposed,
-        "decoder_shape": list(decoder.shape),
-        "n_features_total": n_features_total,
-        "d_model": d_model,
-    }
     logger.info(f"Decoder loaded: shape={decoder.shape}, chosen_key={chosen_key}, transposed={transposed}")
     return decoder, metadata
 
@@ -211,46 +309,87 @@ def load_gemmascope_full(cfg: dict) -> dict:
         metadata:   dict with npz_path, keys used, shapes
     """
     decoder, meta = load_gemmascope_decoder(cfg)
-    npz_path = meta["npz_path"]
+    weights_path = meta["weights_path"]
     n_features = meta["n_features_total"]
     d_model = meta["d_model"]
 
-    data = np.load(npz_path)
+    if meta.get("weights_format") == "pt":
+        state = torch.load(weights_path, map_location="cpu", weights_only=True)
 
-    enc_key = _find_npz_key(data, "W_enc")
-    if enc_key is None:
-        raise ValueError(
-            f"Cannot find encoder weights in NPZ. Keys: {list(data.keys())}. "
-            "Expected a key containing 'W_enc' or 'encoder'."
+        # encoder.weight: (n_features, d_model) or (d_model, n_features)
+        enc_raw = state.get("encoder.weight") or state.get("W_enc")
+        if enc_raw is None:
+            raise ValueError(
+                f"Cannot find encoder weights in PT state dict. Keys: {list(state.keys())}. "
+                "Expected 'encoder.weight' or 'W_enc'."
+            )
+        W_enc = enc_raw.to(torch.float32)
+        if W_enc.shape == (n_features, d_model):
+            W_enc = W_enc.T
+        assert W_enc.shape == (d_model, n_features), (
+            f"W_enc shape {tuple(W_enc.shape)} != expected ({d_model}, {n_features})"
         )
-    W_enc = torch.from_numpy(np.asarray(data[enc_key], dtype=np.float32))
-    if W_enc.shape == (n_features, d_model):
-        W_enc = W_enc.T
-    assert W_enc.shape == (d_model, n_features), (
-        f"W_enc shape {W_enc.shape} != expected ({d_model}, {n_features})"
-    )
 
-    benc_key = _find_npz_key(data, "b_enc")
-    if benc_key is None:
-        raise ValueError(
-            f"Cannot find encoder bias in NPZ. Keys: {list(data.keys())}. "
-            "Expected a key containing 'b_enc' or 'encoder_bias'."
+        b_enc_raw = state.get("encoder.bias") or state.get("b_enc")
+        if b_enc_raw is None:
+            raise ValueError(
+                f"Cannot find encoder bias in PT state dict. Keys: {list(state.keys())}. "
+                "Expected 'encoder.bias' or 'b_enc'."
+            )
+        b_enc = b_enc_raw.to(torch.float32)
+        assert b_enc.shape == (n_features,), f"b_enc shape {tuple(b_enc.shape)} != ({n_features},)"
+
+        thr_raw = state.get("threshold")
+        if thr_raw is None:
+            raise ValueError(
+                f"Cannot find threshold in PT state dict. Keys: {list(state.keys())}. "
+                "Expected 'threshold'."
+            )
+        threshold = thr_raw.to(torch.float32)
+        assert threshold.shape == (n_features,), f"threshold shape {tuple(threshold.shape)} != ({n_features},)"
+
+        meta["enc_key"] = "encoder.weight"
+        meta["benc_key"] = "encoder.bias"
+        meta["thr_key"] = "threshold"
+
+    else:
+        # NPZ path — unchanged
+        data = np.load(weights_path)
+
+        enc_key = _find_npz_key(data, "W_enc")
+        if enc_key is None:
+            raise ValueError(
+                f"Cannot find encoder weights in NPZ. Keys: {list(data.keys())}. "
+                "Expected a key containing 'W_enc' or 'encoder'."
+            )
+        W_enc = torch.from_numpy(np.asarray(data[enc_key], dtype=np.float32))
+        if W_enc.shape == (n_features, d_model):
+            W_enc = W_enc.T
+        assert W_enc.shape == (d_model, n_features), (
+            f"W_enc shape {W_enc.shape} != expected ({d_model}, {n_features})"
         )
-    b_enc = torch.from_numpy(np.asarray(data[benc_key], dtype=np.float32))
-    assert b_enc.shape == (n_features,), f"b_enc shape {b_enc.shape} != ({n_features},)"
 
-    thr_key = _find_npz_key(data, "threshold")
-    if thr_key is None:
-        raise ValueError(
-            f"Cannot find threshold in NPZ. Keys: {list(data.keys())}. "
-            "Expected a key containing 'threshold' or 'thr'."
-        )
-    threshold = torch.from_numpy(np.asarray(data[thr_key], dtype=np.float32))
-    assert threshold.shape == (n_features,), f"threshold shape {threshold.shape} != ({n_features},)"
+        benc_key = _find_npz_key(data, "b_enc")
+        if benc_key is None:
+            raise ValueError(
+                f"Cannot find encoder bias in NPZ. Keys: {list(data.keys())}. "
+                "Expected a key containing 'b_enc' or 'encoder_bias'."
+            )
+        b_enc = torch.from_numpy(np.asarray(data[benc_key], dtype=np.float32))
+        assert b_enc.shape == (n_features,), f"b_enc shape {b_enc.shape} != ({n_features},)"
 
-    meta["enc_key"] = enc_key
-    meta["benc_key"] = benc_key
-    meta["thr_key"] = thr_key
+        thr_key = _find_npz_key(data, "threshold")
+        if thr_key is None:
+            raise ValueError(
+                f"Cannot find threshold in NPZ. Keys: {list(data.keys())}. "
+                "Expected a key containing 'threshold' or 'thr'."
+            )
+        threshold = torch.from_numpy(np.asarray(data[thr_key], dtype=np.float32))
+        assert threshold.shape == (n_features,), f"threshold shape {threshold.shape} != ({n_features},)"
+
+        meta["enc_key"] = enc_key
+        meta["benc_key"] = benc_key
+        meta["thr_key"] = thr_key
 
     logger.info(
         f"Full SAE loaded: W_dec={decoder.shape}, W_enc={W_enc.shape}, "

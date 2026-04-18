@@ -1,0 +1,67 @@
+# Gemma-2-27B-IT with GemmaScope-27B-PT-Res (131K features) — Layer 22
+#
+# Model: google/gemma-2-27b-it
+# SAE:   google/gemma-scope-27b-pt-res  (same NPZ format as 2B and 9B)
+# Layer: 22 out of 46 (~48% depth — direct proportional match to 9B L20, the strongest signal condition)
+#
+# NOTE: gemma-scope-27b-pt-res only ships width_131k (not 16k).
+# Available layers: 10, 22, 34. Available l0 buckets at layer_22/width_131k:
+#   average_l0_20, 31, 48, 82, 150, 290
+# Using average_l0_82 (closest to 9B L20 l0=68).
+# If the geometry signal replicates here, run L10 (~22%) and L34 (~74%) as ablations.
+
+model:
+  model_id: "google/gemma-2-27b-it"
+  device: "auto"
+  dtype: "bfloat16"
+  max_new_tokens: 64
+  temperature: 0.0
+  do_sample: false
+
+sae:
+  source: "neuronpedia"
+  sae_set: "gemmascope-res-131k"
+  sae_id: "22-gemmascope-res-131k"
+  layer_idx: 22
+  hook_point: "blocks.22.hook_resid_post"
+  normalize_decoder: true
+  weights_repo: "google/gemma-scope-27b-pt-res"
+  weights_path: "layer_22/width_131k/average_l0_82/params.npz"
+  n_features_total: 131072
+
+architecture:
+  d_model: 4608
+  n_layers: 46
+  vocab_size: 256000
+
+sae_specs:
+  decoder_shape: [131072, 4608]
+
+features:
+  n_features: 300
+  selection_mode: "contrast_delta"
+  activation_stats_path: null
+  selected_features_file: "outputs/selected_features_27b_l22.json"
+  tau_act: 2.0
+  token_span: "last_n"
+  token_span_last_n: 8
+
+steering:
+  alpha_grid: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0]
+  threshold_T: 0.10
+  alpha0: 1.0
+  tau: 0.1
+
+benchmark:
+  name: "salad_bench"
+  prompt_count: 100
+  prompt_csv: "data/prompts/salad_alpha.csv"
+  prompt_template: "prompt column; refusal mode (no target column needed)"
+
+generation:
+  max_new_tokens: 64
+
+experiment:
+  name: "gemma2-27b-gemmascope-res131k-layer22"
+  seed: 42
+  phase: 2
