@@ -186,6 +186,148 @@ def make_steer_prehook_amax_lastpos(model, layer_idx: int, alpha: float,
     return _mk, ran
 
 
+# ------------------------------------------------------------------
+# Batched hook makers (alpha-batching: one forward per (prompt, feat))
+# ------------------------------------------------------------------
+
+def make_steer_prehook_batched_alphas(model, layer_idx, alphas_batch, pos, steer_dir):
+    """Logit mode, no amax: apply alphas_batch[b] * steer_dir at pos for batch element b."""
+    ran = {"ok": False}
+    alpha_t = torch.tensor(alphas_batch, dtype=torch.float32)  # [B]
+    def _mk():
+        def _prehook(module, inputs):
+            hidden = inputs[0]  # [B, seq, d_model]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            dev = hidden2.device
+            alpha_col = alpha_t.to(device=dev, dtype=hidden2.dtype).unsqueeze(1)  # [B, 1]
+            delta = alpha_col * steer_dir.to(device=dev, dtype=hidden2.dtype)      # [B, d_model]
+            hidden2[:, pos, :] = hidden2[:, pos, :] + delta
+            return (hidden2,) + inputs[1:]
+        return model.model.layers[layer_idx].register_forward_pre_hook(_prehook)
+    return _mk, ran
+
+
+def make_steer_prehook_batched_alphas_amax(model, layer_idx, alphas_batch, pos, steer_dir,
+                                           W_enc, b_enc, threshold):
+    """Logit mode, amax: compute a_max once (all copies identical at hook time), apply per-alpha."""
+    ran = {"ok": False, "a_max_values": []}
+    alpha_t = torch.tensor(alphas_batch, dtype=torch.float32)  # [B]
+    def _mk():
+        ran["a_max_values"].clear()
+        def _prehook(module, inputs):
+            hidden = inputs[0]  # [B, seq, d_model]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            dev = hidden2.device
+            # All B copies have the same residual before the hook layer
+            resid = hidden2[0, pos, :].float()
+            a_max = _compute_a_max(resid, W_enc, b_enc, threshold)
+            ran["a_max_values"].append(float(a_max.item()))
+            alpha_col = alpha_t.to(device=dev, dtype=hidden2.dtype).unsqueeze(1)  # [B, 1]
+            delta = alpha_col * (a_max.to(dtype=hidden2.dtype) * steer_dir.to(device=dev, dtype=hidden2.dtype))
+            hidden2[:, pos, :] = hidden2[:, pos, :] + delta
+            return (hidden2,) + inputs[1:]
+        return model.model.layers[layer_idx].register_forward_pre_hook(_prehook)
+    return _mk, ran
+
+
+def make_steer_prehook_amax_lastpos_batched(model, layer_idx, alphas_batch, steer_dir,
+                                            W_enc, b_enc, threshold):
+    """Generation/refusal, amax: vectorized per-element a_max (batched matmul, no Python loop)."""
+    ran = {"ok": False, "a_max_values": []}
+    alpha_t = torch.tensor(alphas_batch, dtype=torch.float32)  # [B]
+    def _mk():
+        ran["a_max_values"].clear()
+        def _prehook(module, inputs):
+            hidden = inputs[0]  # [B, seq_t, d_model]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            dev = hidden2.device
+            resids = hidden2[:, -1, :].float()               # [B, d_model]
+            z = resids @ W_enc + b_enc                        # [B, n_features]
+            if threshold is not None:
+                z = z - threshold.unsqueeze(0)
+            a_max_t = torch.relu(z).max(dim=-1).values        # [B]
+            ran["a_max_values"].extend(a_max_t.tolist())
+            alpha_col = alpha_t.to(device=dev, dtype=hidden2.dtype)              # [B]
+            scale = (alpha_col * a_max_t.to(dtype=hidden2.dtype)).unsqueeze(1)  # [B, 1]
+            delta = scale * steer_dir.to(device=dev, dtype=hidden2.dtype).unsqueeze(0)  # [B, d_model]
+            hidden2[:, -1, :] = hidden2[:, -1, :] + delta
+            return (hidden2,) + inputs[1:]
+        return model.model.layers[layer_idx].register_forward_pre_hook(_prehook)
+    return _mk, ran
+
+
+def make_steer_prehook_all_pos_batched(model, layer_idx, alphas_batch, steer_dir):
+    """Generation/refusal, no amax: apply alphas_batch[b] * steer_dir at all positions for element b."""
+    ran = {"ok": False}
+    alpha_t = torch.tensor(alphas_batch, dtype=torch.float32)  # [B]
+    def _mk():
+        def _prehook(module, inputs):
+            hidden = inputs[0]  # [B, seq, d_model]
+            ran["ok"] = True
+            hidden2 = hidden.clone()
+            dev = hidden2.device
+            alpha_col = alpha_t.to(device=dev, dtype=hidden2.dtype).view(-1, 1, 1)  # [B, 1, 1]
+            hidden2 = hidden2 + alpha_col * steer_dir.to(device=dev, dtype=hidden2.dtype)
+            return (hidden2,) + inputs[1:]
+        return model.model.layers[layer_idx].register_forward_pre_hook(_prehook)
+    return _mk, ran
+
+
+# ------------------------------------------------------------------
+# Batched inference functions
+# ------------------------------------------------------------------
+
+@torch.no_grad()
+def forward_last_logits_batched(model, tokenizer, prompt, n_copies, prehook=None):
+    """Tokenize once, expand to [n_copies, seq], run one forward pass.
+    Returns (logits_all [B, vocab], input_ids [seq], resid_all [B, d_model])."""
+    device = next(model.parameters()).device
+    single = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids_batch = single["input_ids"].expand(n_copies, -1)
+    attn_mask_batch = single["attention_mask"].expand(n_copies, -1)
+    handle = prehook() if prehook else None
+    try:
+        out = model(input_ids=input_ids_batch, attention_mask=attn_mask_batch,
+                    output_hidden_states=True)
+    finally:
+        if handle is not None:
+            handle.remove()
+    logits_all = out.logits[:, -1, :].float().detach()            # [B, vocab]
+    resid_all  = out.hidden_states[-1][:, -1, :].float().detach() # [B, d_model]
+    return logits_all, single["input_ids"][0], resid_all
+
+
+@torch.no_grad()
+def generate_steered_batched(model, tokenizer, prompt, max_new_tokens, n_copies,
+                              prehook=None, use_chat_template=False):
+    """Generate from n_copies identical prompts simultaneously. Returns list of n_copies strings."""
+    device = next(model.parameters()).device
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+        single = tokenizer(text, return_tensors="pt").to(device)
+    else:
+        single = tokenizer(prompt, return_tensors="pt").to(device)
+    # .repeat() not .expand(): generate() needs contiguous writable tensors
+    input_ids_batch = single["input_ids"].repeat(n_copies, 1)
+    attn_mask_batch = single["attention_mask"].repeat(n_copies, 1)
+    handle = prehook() if prehook else None
+    try:
+        out_ids = model.generate(
+            input_ids=input_ids_batch, attention_mask=attn_mask_batch,
+            max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0,
+        )
+    finally:
+        if handle is not None:
+            handle.remove()
+    prompt_len = single["input_ids"].shape[1]
+    return [tokenizer.decode(out_ids[b, prompt_len:], skip_special_tokens=True)
+            for b in range(n_copies)]
+
+
 def encode_target(tokenizer, t):
     if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t.strip() == ""):
         return None
@@ -410,6 +552,10 @@ def main():
                     help="Use vanilla fixed-vector steering (alpha * W_dec[f]) instead of "
                          "activation-scaled steering (alpha * a_max * W_dec[f]). "
                          "Run as control condition to isolate the a_max confound.")
+    ap.add_argument("--alpha_batch_size", type=int, default=0,
+                    help="Number of non-zero alphas to process per batched forward/generate call. "
+                         "0 (default) = all non-zero alphas together. "
+                         "Reduce if OOM (e.g. --alpha_batch_size 6 on 24GB GPU).")
     args = ap.parse_args()
 
     if args.micro_sweep:
@@ -531,6 +677,41 @@ def main():
         _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc)
 
 
+# ------------------------------------------------------------------
+# Alpha-batching helpers
+# ------------------------------------------------------------------
+
+def _chunk_alphas(alphas_nonzero, alpha_batch_size):
+    """Split non-zero alphas into sub-batches of at most alpha_batch_size each.
+    alpha_batch_size=0 means put everything in one chunk."""
+    if alpha_batch_size <= 0 or alpha_batch_size >= len(alphas_nonzero):
+        return [alphas_nonzero]
+    return [alphas_nonzero[i:i + alpha_batch_size]
+            for i in range(0, len(alphas_nonzero), alpha_batch_size)]
+
+
+def _build_logit_row(pi, fid, alpha, steer_logits, steer_resid, pc, args,
+                     hook_ran=True, a_max_val=0.0):
+    tid = pc["target_id"]
+    steer_t = torch.dot(steer_resid, pc["w_t"])
+    delta_target = float((steer_t - pc["base_t"]).item())
+    d = steer_logits - pc["base_logits"]
+    return {
+        "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+        "seq_len": pc["seq_len"], "target_id": int(tid),
+        "delta_logit_target": delta_target,
+        "tv_distance": tv_distance_from_logits(pc["base_logits"], steer_logits),
+        "kl_base_to_steer": kl_pq_from_logits(pc["base_logits"], steer_logits),
+        "topk_jaccard": topk_jaccard(pc["base_logits"], steer_logits, k=args.topk),
+        "max_abs_dlogit": float(d.abs().max().item()),
+        "hook_ran": bool(hook_ran),
+        "base_rank": int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item()),
+        "steer_rank": int((steer_logits >= steer_logits[tid]).sum().item()),
+        "target_is_top1": bool((steer_logits >= steer_logits[tid]).sum().item() == 1),
+        "a_max": a_max_val,
+    }
+
+
 # ===========================================================
 # Logit mode (factual QA: delta_logit_target)
 # ===========================================================
@@ -560,8 +741,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             seq_len=seq_len, pos=pos, target_id=target_id, w_t=w_t, base_t=base_t,
         )
 
-    all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
-    total_tasks = len(all_jobs)
+    total_tasks = len(dfp) * len(feature_ids) * len(alphas_sorted)
     run_csv = Path(args.out_dir) / "run_rows.csv"
     start_time = time.time()
     buffer = []
@@ -574,66 +754,44 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
 
     print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
 
-    completed_this_session = 0
-    for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering")):
-        if (pi, fid, alpha) in done:
-            continue
+    alphas_nonzero = [a for a in alphas_sorted if a != 0.0]
+    alpha_chunks = _chunk_alphas(alphas_nonzero, args.alpha_batch_size)
+    all_pairs = list(dict.fromkeys(product(dfp.index, feature_ids)))
 
+    completed_this_session = 0
+    for pi, fid in tqdm(all_pairs, desc="Steering (batched)"):
         pc = prompt_cache[pi]
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
 
-        if alpha == 0.0:
-            steer_logits = pc["base_logits"]
-            steer_resid = pc["base_resid"]
-            hook_ran = True
-            a_max_val = 0.0
-        elif use_amax:
-            mk_hook, cap = make_steer_prehook_amax(model, args.layer, alpha, pc["pos"],
-                                                    steer_dir, W_enc, b_enc, threshold)
-            t0 = time.time()
-            steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
-            t1 = time.time()
-            hook_ran = cap["ok"]
-            a_max_val = cap["a_max_values"][0] if cap["a_max_values"] else 0.0
-            if (t1 - t0) > 2.0:
-                print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
-        else:
-            mk_hook, cap = make_steer_prehook(model, args.layer, alpha, pc["pos"], steer_dir)
-            t0 = time.time()
-            steer_logits, _, steer_resid = forward_last_logits(model, tokenizer, pc["prompt"], prehook=mk_hook)
-            t1 = time.time()
-            hook_ran = cap["ok"]
-            a_max_val = 1.0  # sentinel: no scaling
-            if (t1 - t0) > 2.0:
-                print(f"[SLOW] forward {t1-t0:.2f}s  prompt={pi} feat={fid} alpha={alpha}")
+        # alpha=0: served from cache, no forward pass needed
+        if (pi, fid, 0.0) not in done:
+            buffer.append(_build_logit_row(pi, fid, 0.0, pc["base_logits"], pc["base_resid"], pc, args,
+                                           hook_ran=True, a_max_val=0.0))
+            done.add((pi, fid, 0.0))
+            completed_this_session += 1
 
-        steer_t = torch.dot(steer_resid, pc["w_t"])
-        delta_target = float((steer_t - pc["base_t"]).item())
+        for chunk in alpha_chunks:
+            pending = [a for a in chunk if (pi, fid, a) not in done]
+            if not pending:
+                continue
+            B = len(pending)
+            if use_amax:
+                mk_hook, cap = make_steer_prehook_batched_alphas_amax(
+                    model, args.layer, pending, pc["pos"], steer_dir, W_enc, b_enc, threshold)
+            else:
+                mk_hook, cap = make_steer_prehook_batched_alphas(
+                    model, args.layer, pending, pc["pos"], steer_dir)
 
-        d = steer_logits - pc["base_logits"]
-        max_abs = float(d.abs().max().item())
-        tv = tv_distance_from_logits(pc["base_logits"], steer_logits)
-        kl = kl_pq_from_logits(pc["base_logits"], steer_logits)
-        jac = topk_jaccard(pc["base_logits"], steer_logits, k=args.topk)
+            logits_all, _, resid_all = forward_last_logits_batched(
+                model, tokenizer, pc["prompt"], B, prehook=mk_hook)
+            # logits_all: [B, vocab], resid_all: [B, d_model]
 
-        tid = pc["target_id"]
-        base_rank = int((pc["base_logits"] >= pc["base_logits"][tid]).sum().item())
-        steer_rank = int((steer_logits >= steer_logits[tid]).sum().item())
-        target_is_top1 = bool(steer_rank == 1)
-
-        row = {
-            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
-            "seq_len": pc["seq_len"], "target_id": int(tid),
-            "delta_logit_target": delta_target,
-            "tv_distance": tv, "kl_base_to_steer": kl,
-            "topk_jaccard": jac, "max_abs_dlogit": max_abs,
-            "hook_ran": bool(hook_ran),
-            "base_rank": base_rank, "steer_rank": steer_rank,
-            "target_is_top1": target_is_top1,
-            "a_max": a_max_val,
-        }
-        buffer.append(row)
-        completed_this_session += 1
+            a_max_val = cap["a_max_values"][0] if cap.get("a_max_values") else (0.0 if use_amax else 1.0)
+            for b_idx, alpha in enumerate(pending):
+                buffer.append(_build_logit_row(pi, fid, alpha, logits_all[b_idx], resid_all[b_idx],
+                                               pc, args, hook_ran=cap["ok"], a_max_val=a_max_val))
+                done.add((pi, fid, alpha))
+                completed_this_session += 1
 
         if len(buffer) >= args.flush_every:
             df_out = pd.DataFrame(buffer)
@@ -642,7 +800,7 @@ def _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_so
             buffer.clear()
             print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
 
-        done_tasks = len(done) + completed_this_session
+        done_tasks = len(done)
         if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
             elapsed = time.time() - start_time
             rate = completed_this_session / max(1e-9, elapsed)
@@ -746,8 +904,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             "base_refusal": _refusal_score(text),
         }
 
-    all_jobs = list(dict.fromkeys(product(dfp.index, feature_ids, alphas_sorted)))
-    total_tasks = len(all_jobs)
+    total_tasks = len(dfp) * len(feature_ids) * len(alphas_sorted)
     run_csv = Path(args.out_dir) / "run_rows.csv"
     start_time = time.time()
     buffer = []
@@ -760,40 +917,58 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
 
     print(f"Total tasks: {total_tasks} ({len(dfp)} prompts x {len(feature_ids)} features x {len(alphas_sorted)} alphas)")
 
-    completed_this_session = 0
-    for task_i, (pi, fid, alpha) in enumerate(tqdm(all_jobs, total=total_tasks, desc="Steering (refusal)")):
-        if (pi, fid, alpha) in done:
-            continue
+    alphas_nonzero = [a for a in alphas_sorted if a != 0.0]
+    alpha_chunks = _chunk_alphas(alphas_nonzero, args.alpha_batch_size)
+    all_pairs = list(dict.fromkeys(product(dfp.index, feature_ids)))
 
+    completed_this_session = 0
+    for pi, fid in tqdm(all_pairs, desc="Steering refusal (batched)"):
         br = baseline_refusal[pi]
         steer_dir = W_dec[fid].to(device=device, dtype=torch.float32)
 
-        if alpha == 0.0:
-            gen_text = br["base_text"]
-            hook_ran = True
-        elif use_amax:
-            mk_hook, cap = make_steer_prehook_amax_lastpos(model, args.layer, alpha,
-                                                            steer_dir, W_enc, b_enc, threshold)
-            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=True)
-            hook_ran = cap["ok"]
-        else:
-            mk_hook, cap = make_steer_prehook_all_pos(model, args.layer, alpha, steer_dir)
-            gen_text = generate_steered(model, tokenizer, br["prompt"], max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=True)
-            hook_ran = cap["ok"]
+        # alpha=0: served from cache, no generation needed
+        if (pi, fid, 0.0) not in done:
+            buffer.append({
+                "prompt_idx": pi, "feature_id": fid, "alpha": 0.0,
+                "refusal_score": br["base_refusal"],
+                "base_refusal": br["base_refusal"],
+                "delta_refusal": 0.0,
+                "hook_ran": True,
+                "gen_text": br["base_text"][:500],
+            })
+            done.add((pi, fid, 0.0))
+            completed_this_session += 1
 
-        ref_score = _refusal_score(gen_text)
-        delta_refusal = ref_score - br["base_refusal"]
+        for chunk in alpha_chunks:
+            pending = [a for a in chunk if (pi, fid, a) not in done]
+            if not pending:
+                continue
+            B = len(pending)
+            if use_amax:
+                mk_hook, cap = make_steer_prehook_amax_lastpos_batched(
+                    model, args.layer, pending, steer_dir, W_enc, b_enc, threshold)
+            else:
+                mk_hook, cap = make_steer_prehook_all_pos_batched(
+                    model, args.layer, pending, steer_dir)
 
-        row = {
-            "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
-            "refusal_score": ref_score,
-            "base_refusal": br["base_refusal"],
-            "delta_refusal": delta_refusal,
-            "hook_ran": bool(hook_ran),
-            "gen_text": gen_text[:500],
-        }
-        buffer.append(row)
-        completed_this_session += 1
+            gen_texts = generate_steered_batched(
+                model, tokenizer, br["prompt"],
+                max_new_tokens=max_new_tokens, n_copies=B,
+                prehook=mk_hook, use_chat_template=True)
+
+            for b_idx, alpha in enumerate(pending):
+                gen_text = gen_texts[b_idx]
+                ref_score = _refusal_score(gen_text)
+                buffer.append({
+                    "prompt_idx": pi, "feature_id": fid, "alpha": alpha,
+                    "refusal_score": ref_score,
+                    "base_refusal": br["base_refusal"],
+                    "delta_refusal": ref_score - br["base_refusal"],
+                    "hook_ran": bool(cap["ok"]),
+                    "gen_text": gen_text[:500],
+                })
+                done.add((pi, fid, alpha))
+                completed_this_session += 1
 
         if len(buffer) >= args.flush_every:
             df_out = pd.DataFrame(buffer)
@@ -802,7 +977,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
             buffer.clear()
             print(f"[Flush] wrote {args.flush_every} rows -> {run_csv}")
 
-        done_tasks = len(done) + completed_this_session
+        done_tasks = len(done)
         if done_tasks > 0 and done_tasks % args.heartbeat_every == 0:
             elapsed = time.time() - start_time
             rate = completed_this_session / max(1e-9, elapsed)
