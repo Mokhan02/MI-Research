@@ -317,7 +317,9 @@ def load_gemmascope_full(cfg: dict) -> dict:
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
 
         # encoder.weight: (n_features, d_model) or (d_model, n_features)
-        enc_raw = state.get("encoder.weight") or state.get("W_enc")
+        enc_raw = state.get("encoder.weight")
+        if enc_raw is None:
+            enc_raw = state.get("W_enc")
         if enc_raw is None:
             raise ValueError(
                 f"Cannot find encoder weights in PT state dict. Keys: {list(state.keys())}. "
@@ -330,7 +332,9 @@ def load_gemmascope_full(cfg: dict) -> dict:
             f"W_enc shape {tuple(W_enc.shape)} != expected ({d_model}, {n_features})"
         )
 
-        b_enc_raw = state.get("encoder.bias") or state.get("b_enc")
+        b_enc_raw = state.get("encoder.bias")
+        if b_enc_raw is None:
+            b_enc_raw = state.get("b_enc")
         if b_enc_raw is None:
             raise ValueError(
                 f"Cannot find encoder bias in PT state dict. Keys: {list(state.keys())}. "
