@@ -919,10 +919,8 @@ def main():
                      "success_best, monotone_best, is_censored")
 
         # Load SAE (config was loaded above)
-        _, meta = load_gemmascope_decoder(config)
-        npz_path = meta["npz_path"]
-        data = np.load(npz_path)
-        W_dec = np.asarray(data["W_dec"], dtype=np.float32)
+        decoder_tensor, meta = load_gemmascope_decoder(config)
+        W_dec = decoder_tensor.numpy().astype(np.float32)
         n_feats_total, d_model = W_dec.shape
         logger.info("W_dec: %d x %d", n_feats_total, d_model)
 
