@@ -132,12 +132,15 @@ def forward_last_logits_batch(model, tokenizer, prompts: list, prehook=None):
     return results
 
 @torch.no_grad()
-def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, prehook=None, use_chat_template: bool = False):
+def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, prehook=None, use_chat_template: bool = False, enable_thinking: bool = True):
     """Generate a short response with optional steering hook. Returns generated text (excluding prompt)."""
     device = next(model.parameters()).device
     if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
         chat = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if not enable_thinking:
+            kwargs["enable_thinking"] = False
+        text = tokenizer.apply_chat_template(chat, **kwargs)
         inputs = tokenizer(text, return_tensors="pt").to(device)
     else:
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -154,7 +157,7 @@ def generate_steered(model, tokenizer, prompt: str, max_new_tokens: int = 64, pr
 @torch.no_grad()
 def generate_steered_batch(
     model, tokenizer, prompts: list, max_new_tokens: int = 64,
-    prehook=None, use_chat_template: bool = False,
+    prehook=None, use_chat_template: bool = False, enable_thinking: bool = True,
 ):
     """Batched generation with optional steering hook.
 
@@ -165,9 +168,12 @@ def generate_steered_batch(
 
     if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
         texts = []
+        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if not enable_thinking:
+            kwargs["enable_thinking"] = False
         for p in prompts:
             chat = [{"role": "user", "content": p}]
-            texts.append(tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True))
+            texts.append(tokenizer.apply_chat_template(chat, **kwargs))
     else:
         texts = list(prompts)
 
@@ -752,11 +758,13 @@ def main():
     _verify_norm = float(_verify_dir.norm().item())
     _verify_prompt = dfp.iloc[0]["prompt"] if len(dfp) > 0 else "Hello"
     use_chat = config.get("model", {}).get("use_chat_template", True)
+    enable_thinking = config.get("model", {}).get("enable_thinking", True)
     mk_hook_v, cap_v = make_steer_prehook_amax_lastpos(
         model, args.layer, 1.0, _verify_dir, W_enc, b_enc, threshold)
     _ = generate_steered_batch(
         model, tokenizer, [_verify_prompt],
         max_new_tokens=1, prehook=mk_hook_v, use_chat_template=use_chat,
+        enable_thinking=enable_thinking,
     )
     _v_amax = cap_v["a_max_values"][0] if cap_v["a_max_values"] else float("nan")
     print(f"[Arad steering check] feature={_verify_fid}, a_max={_v_amax:.6f}, "
@@ -772,6 +780,7 @@ def main():
         _ = generate_steered_batch(
             model, tokenizer, [_v2_prompt],
             max_new_tokens=1, prehook=mk_hook_v2, use_chat_template=use_chat,
+            enable_thinking=enable_thinking,
         )
         _v2_amax = cap_v2["a_max_values"][0] if cap_v2["a_max_values"] else float("nan")
         print(f"[Arad steering check] feature={_v2_fid}, a_max={_v2_amax:.6f} "
@@ -1063,8 +1072,9 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
     max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
 
     use_chat = config.get("model", {}).get("use_chat_template", True)
+    enable_thinking = config.get("model", {}).get("enable_thinking", True)
     batch_size = args.batch_size
-    print(f"[Refusal mode] use_chat_template={use_chat}, batch_size={batch_size}")
+    print(f"[Refusal mode] use_chat_template={use_chat}, enable_thinking={enable_thinking}, batch_size={batch_size}")
     print(f"Computing baseline generations for {len(dfp)} prompts...")
 
     # ------------------------------------------------------------------
@@ -1079,6 +1089,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
         gen_texts = generate_steered_batch(
             model, tokenizer, batch_prompts,
             max_new_tokens=max_new_tokens, use_chat_template=use_chat,
+            enable_thinking=enable_thinking,
         )
         for pi, prompt, text in zip(batch_pis, batch_prompts, gen_texts):
             baseline_refusal[pi] = {
@@ -1149,6 +1160,7 @@ def _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_
                 gen_texts = generate_steered_batch(
                     model, tokenizer, batch_prompts,
                     max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat,
+                    enable_thinking=enable_thinking,
                 )
                 hook_ran = cap["ok"]
                 # First forward pass produces one a_max per batch row;
@@ -1406,6 +1418,7 @@ def _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, a
 
     max_new_tokens = int(config.get("generation", {}).get("max_new_tokens", 64))
     use_chat = config.get("model", {}).get("use_chat_template", True)
+    enable_thinking = config.get("model", {}).get("enable_thinking", True)
     run_csv = Path(args.out_dir) / "run_rows_multi.csv"
     buffer = []
     multi_feature_label = f"multi_top{n}"
@@ -1459,7 +1472,8 @@ def _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, a
         baseline_refusal = {}
         for pi, prow in tqdm(dfp.iterrows(), total=len(dfp), desc="Baseline gen"):
             text = generate_steered(model, tokenizer, prow["prompt"],
-                                    max_new_tokens=max_new_tokens, use_chat_template=use_chat)
+                                    max_new_tokens=max_new_tokens, use_chat_template=use_chat,
+                                    enable_thinking=enable_thinking)
             baseline_refusal[pi] = {
                 "prompt": prow["prompt"],
                 "base_text": text,
@@ -1476,7 +1490,8 @@ def _run_multi_feature_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, a
                     model, args.layer, alpha, steer_dirs,
                     sae_enc["W_enc"], sae_enc["b_enc"], sae_enc["threshold"])
                 gen_text = generate_steered(model, tokenizer, br["prompt"],
-                                            max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat)
+                                            max_new_tokens=max_new_tokens, prehook=mk_hook, use_chat_template=use_chat,
+                                            enable_thinking=enable_thinking)
 
             ref_score = _refusal_score(gen_text)
             buffer.append({

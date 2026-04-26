@@ -23,9 +23,10 @@ model:
   model_id: "Qwen/Qwen3-8B"
   device: "auto"
   dtype: "bfloat16"
-  max_new_tokens: 64
+  max_new_tokens: 256
   temperature: 0.0
   do_sample: false
+  enable_thinking: false
 
 sae:
   source: "adamkarvonen"
@@ -68,7 +69,7 @@ benchmark:
   prompt_template: "prompt column; refusal mode (no target column needed)"
 
 generation:
-  max_new_tokens: 64
+  max_new_tokens: 256
 
 experiment:
   name: "qwen3-8b-batch-topk-16k-layer18"
