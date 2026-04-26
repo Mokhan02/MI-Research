@@ -350,6 +350,8 @@ def load_gemmascope_full(cfg: dict) -> dict:
                 "Expected 'threshold'."
             )
         threshold = thr_raw.to(torch.float32)
+        if threshold.dim() == 0:
+            threshold = threshold.expand(n_features)
         assert threshold.shape == (n_features,), f"threshold shape {tuple(threshold.shape)} != ({n_features},)"
 
         meta["enc_key"] = "encoder.weight"
