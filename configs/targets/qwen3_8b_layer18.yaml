@@ -69,7 +69,7 @@ benchmark:
   prompt_template: "prompt column; refusal mode (no target column needed)"
 
 generation:
-  max_new_tokens: 256
+  max_new_tokens: 128
 
 experiment:
   name: "qwen3-8b-batch-topk-16k-layer18"
