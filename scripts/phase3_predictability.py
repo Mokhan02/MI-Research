@@ -957,9 +957,11 @@ def main():
                 model, tokenizer = load_model(config)
                 model.eval()
                 device = next(model.parameters()).device
-                W_enc = torch.tensor(np.asarray(data["W_enc"], dtype=np.float32), device=device)
-                b_enc = torch.tensor(np.asarray(data["b_enc"], dtype=np.float32), device=device)
-                thr = torch.tensor(np.asarray(data["threshold"], dtype=np.float32), device=device)
+                from src.sae_loader import load_gemmascope_full
+                sae_full = load_gemmascope_full(config)
+                W_enc = sae_full["W_enc"].to(device=device, dtype=torch.float32)
+                b_enc = sae_full["b_enc"].to(device=device, dtype=torch.float32)
+                thr = sae_full["threshold"].to(device=device, dtype=torch.float32)
                 if W_enc.shape[0] != d_model:
                     W_enc = W_enc.T
                 prompt_csv = args.prompt_csv or "data/prompts/salad_alpha.csv"
