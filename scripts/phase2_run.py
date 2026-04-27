@@ -568,7 +568,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Load config first (needed for defaults and SAE assertion)
+    import wandb
     config = resolve_config(load_config(args.config), run_id="phase2_run")
+    wandb.init(project="mi-research", name=config["experiment"]["name"], config=config)
     sae_id = config.get("sae", {}).get("sae_id")
     if sae_id in ("TBD", "", None):
         raise ValueError(
@@ -675,6 +677,9 @@ def main():
         _run_logit_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc)
     else:
         _run_refusal_mode(model, tokenizer, dfp, W_dec, feature_ids, alphas, alphas_sorted, threshold_T, args, config, sae_enc)
+
+    wandb.log({"run_complete": True})
+    wandb.finish()
 
 
 # ------------------------------------------------------------------
